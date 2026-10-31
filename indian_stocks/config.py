@@ -104,13 +104,3 @@ class StrategyConfig:
 
     def as_dict(self) -> dict:
         return asdict(self)
-
-
-@dataclass
-class ExecConfig:
-    """Execution / accounting assumptions for the simulation (NOT part of the original bot)."""
-    capital: float = 2_000_000.0     # INR
-    fee_bps_per_side: float = 12.0   # brokerage + STT + exchange + GST + stamp, delivery, rough
-    slippage_bps: float = 5.0        # applied to market-type fills: exits, stops, marketable TP2
-    benchmark: str = "^NSEI"         # Nifty 50 (yahoo).  nse/csv providers: use NIFTYBEES
-    trade_start: str = ""            # first date new entries are allowed ('' = after warm-up only)

@@ -3,7 +3,3 @@ __pycache__/
 .pytest_cache/
 .venv/
 .env
-
-# runtime output
-data/cache/
-results/

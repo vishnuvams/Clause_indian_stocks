@@ -1,4 +1,4 @@
-"""Entry gates, shared by the simulator (`engine.py`) and the live `scan` command.
+"""Entry gates.
 
 Port of `_select_setup` + `_maintain_entry_limit` (+ the reason text of `_flat_reason`).
 
