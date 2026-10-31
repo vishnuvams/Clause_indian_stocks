@@ -14,7 +14,7 @@ from .data import drop_incomplete_last_bar, get_provider, ist_now
 from .entry import evaluate_entry
 from . import position as posrules
 from .frames import Frame
-from .selection import regime_allowed, select_symbol
+from .selection import longs_allowed, select_symbol
 from .universe import load_universe
 
 WARMUP_DAYS = 420      # calendar days of history loaded before --start (EMA50 + 250-candle windows)
@@ -42,17 +42,14 @@ def add_common(ap: argparse.ArgumentParser):
 
 def add_strategy(ap: argparse.ArgumentParser):
     d = StrategyConfig()
-    ap.add_argument("--shorts", type=_str2bool, default=d.enable_shorts, help="enable the mirror SHORT strategy")
     ap.add_argument("--min-turnover-cr", type=float, default=d.min_turnover_inr / 1e7,
                     help="volume floor in crore INR of traded value (default = 500k USD)")
     ap.add_argument("--adr-min", type=float, default=d.adr_min_pct)
     ap.add_argument("--rs-long", type=float, default=d.rs_min_pct_long)
-    ap.add_argument("--rs-short", type=float, default=d.rs_min_pct_short)
     ap.add_argument("--near-high", type=float, default=d.near_high_max_pct)
     ap.add_argument("--exit-mode", default=d.exit_mode, choices=["ema9_ema21", "ema9_ema50", "ema9_ema21_ema50"])
     ap.add_argument("--lower-close-ema", default=d.exit_profit_2closes, choices=["ema9", "ema21", "ema50", "off"])
     ap.add_argument("--long-inr", type=float, default=d.initial_entry_inr_long)
-    ap.add_argument("--short-inr", type=float, default=d.initial_entry_inr_short)
     ap.add_argument("--leverage", type=float, default=d.leverage)
     ap.add_argument("--regime", type=_str2bool, default=d.regime_filter_enabled)
     ap.add_argument("--signal-interval", default=d.signal_interval)
@@ -61,10 +58,10 @@ def add_strategy(ap: argparse.ArgumentParser):
 
 def make_cfg(a) -> StrategyConfig:
     return replace(StrategyConfig(),
-                   enable_shorts=a.shorts, min_turnover_inr=a.min_turnover_cr * 1e7, adr_min_pct=a.adr_min,
-                   rs_min_pct_long=a.rs_long, rs_min_pct_short=a.rs_short, near_high_max_pct=a.near_high,
+                   min_turnover_inr=a.min_turnover_cr * 1e7, adr_min_pct=a.adr_min,
+                   rs_min_pct_long=a.rs_long, near_high_max_pct=a.near_high,
                    exit_mode=a.exit_mode, exit_profit_2closes=a.lower_close_ema,
-                   initial_entry_inr_long=a.long_inr, initial_entry_inr_short=a.short_inr, leverage=a.leverage,
+                   initial_entry_inr_long=a.long_inr, leverage=a.leverage,
                    regime_filter_enabled=a.regime, signal_interval=a.signal_interval,
                    pyramid_interval=a.pyramid_interval)
 
@@ -117,7 +114,7 @@ def cmd_scan(a):
     bench_df = data.pop(bench_sym, None)
     bench = Frame.from_df(drop_incomplete_last_bar(bench_df), None) if bench_df is not None and len(bench_df) else None
     kb = len(bench) - 1 if bench else -1
-    regime = regime_allowed(bench, kb, cfg, None)
+    longs_ok = longs_allowed(bench, kb, cfg, None)          # None = regime filter off
     rows = []
     for sym in syms:
         df = data.get(sym)
@@ -127,7 +124,7 @@ def cmd_scan(a):
         kd = len(D) - 1
         x = D.c[kd]
         sel = select_symbol(D, kd, x, bench, kb, cfg)
-        row = {"symbol": sym, "close": x, "selected": sel.ok, "side": sel.direction,
+        row = {"symbol": sym, "close": x, "selected": sel.ok,
                "rs_pts": None if sel.rs is None else round(sel.rs * 100, 1), "adr_pct": sel.adr and round(sel.adr, 2),
                "traded_cr": round(sel.turnover / 1e7, 2), "why": "" if sel.ok else sel.reason,
                "entry_limit": None, "stop": None, "tp1": None, "note": ""}
@@ -140,15 +137,14 @@ def cmd_scan(a):
                 c, live=live, done=done, prev_close=D.c[kd], daily_ribbon=live,
                 near=rules.near_extreme_stats(closes, c.near_high_lookback),
                 lower_high=rules.lower_high_stats(closes, c.lower_high_recent_days, c.lower_high_prior_days),
-                x=x, rs_dir=sel.direction, regime=regime,
-                eband=rules.band_label(c.entry_ema), eband_s=rules.band_label(c.entry_ema_short))
+                x=x, regime_blocks_longs=longs_ok is False, band=rules.band_label(c.entry_ema))
             if direction:
-                units = max(int((c.initial_entry_inr_short if direction == rules.SHORT else c.initial_entry_inr_long) / limit), 1)
-                stop = posrules.stop_levels(direction, limit, units, c)[-1][0]       # deepest tier
-                t1 = posrules.tp1(direction, limit, units, c)
+                units = max(int(c.initial_entry_inr_long / limit), 1)
+                stop = posrules.stop_levels(limit, units, c)[-1][0]                  # deepest tier
+                t1 = posrules.tp1(limit, units, c)
                 row.update(entry_limit=round(limit, 2), stop=round(stop, 2),
                            tp1=round(t1[0], 2) if t1 else None,
-                           note=f"{direction} limit on {band}")
+                           note=f"limit on {band}")
             else:
                 row["note"] = why
         rows.append(row)
@@ -159,7 +155,7 @@ def cmd_scan(a):
     out.to_csv(a.out, index=False)
     sel = out[out["selected"]]
     pd.set_option("display.width", 200)
-    print(f"regime: {regime or 'filter off'} | {len(sel)} of {len(out)} stocks on the watchlist\n")
+    print(f"regime: {'filter off' if longs_ok is None else ('longs allowed' if longs_ok else 'longs blocked')} | {len(sel)} of {len(out)} stocks on the watchlist\n")
     if len(sel):
         print(sel.drop(columns=["selected", "why"]).to_string(index=False))
     print(f"\nfull table (incl. why each stock was dropped) -> {a.out}")

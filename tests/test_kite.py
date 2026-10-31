@@ -46,7 +46,7 @@ def test_entry_and_add_are_day_limit_buys_in_delivery():
 def test_stop_is_a_single_gtt_below_the_price_and_is_seen_as_a_trigger():
     hl = market(100.0)
     b, k = broker(hl)
-    kind, oid = b.place_stop(False, 10, 90.0, 85.5)
+    kind, oid = b.place_stop(10, 90.0, 85.5)
     assert kind == "resting" and oid >= GTT_OFFSET
     g = [c for c in k.calls if c[0] == "place_gtt"][0][1]
     assert g["trigger_type"] == "single" and g["trigger_values"] == [90.0] and g["last_price"] == 100.0
@@ -78,7 +78,7 @@ def test_target_already_reached_sells_with_a_day_order_instead_of_an_impossible_
 def test_stop_already_breached_exits_now():
     hl = market(85.0, pos=(10, 100.0))
     b, k = broker(hl)
-    b.place_stop(False, 10, 90.0, 85.5)
+    b.place_stop(10, 90.0, 85.5)
     assert not any(c[0] == "place_gtt" for c in k.calls) and hl.pos_size == 0
 
 
@@ -86,33 +86,31 @@ def test_cancel_routes_gtt_ids_to_delete_gtt_and_order_ids_to_cancel_order():
     hl = market()
     b, k = broker(hl)
     _, o1 = b.place_limit(True, 5, 95.0)
-    _, g1 = b.place_stop(False, 5, 90.0, 85.5)
+    _, g1 = b.place_stop(5, 90.0, 85.5)
     b.cancel(g1)
     b.cancel(o1)
     assert [c[0] for c in k.calls if c[0] in ("delete_gtt", "cancel_order")] == ["delete_gtt", "cancel_order"]
     assert b.orders() == []
 
 
-def test_shorting_is_refused_not_silently_translated():
-    b, _ = broker(market())
-    with pytest.raises(KiteUnsupported):
-        b.place_limit(False, 5, 105.0)                             # opening sell
-    with pytest.raises(KiteUnsupported):
-        b.place_limit(True, 5, 95.0, reduce_only=True)             # buy to cover
-    with pytest.raises(KiteUnsupported):
-        b.place_stop(True, 5, 110.0, 115.0)
-    with pytest.raises(KiteUnsupported):
-        b.market_close(False, 5, 103.0)
+def test_only_the_long_orders_the_trader_uses_are_accepted():
+    """Buy limit = entry/add, reduce-only sell = take-profit.  Anything else is a programming error, not an order."""
+    b, k = broker(market())
+    with pytest.raises(ValueError):
+        b.place_limit(False, 5, 105.0)                              # an opening sell
+    with pytest.raises(ValueError):
+        b.place_limit(True, 5, 95.0, reduce_only=True)              # a reduce-only buy
+    assert [c for c in k.calls if c[0] in ("place_order", "place_gtt")] == []
 
 
 def test_market_close_is_an_ioc_limit_and_reports_whether_it_filled():
     hl = market(100.0, pos=(10, 90.0))
     b, k = broker(hl)
-    assert b.market_close(True, 10, 97.0) is True
+    assert b.market_close(10, 97.0) is True
     assert [c[1]["validity"] for c in k.calls if c[0] == "place_order"] == ["IOC"] and hl.pos_size == 0
     hl2 = market(100.0, pos=(10, 90.0))
     b2, _ = broker(hl2)
-    assert b2.market_close(True, 10, 101.0) is False or hl2.pos_size == 0      # limit above a sell: would fill; never lies
+    assert b2.market_close(10, 101.0) is False and hl2.pos_size == 10      # IOC above the market: not filled, and it says so
 
 
 def test_position_from_holdings_and_todays_buys():
@@ -220,10 +218,10 @@ class NSEFakeBroker(D.FakeBroker):
     """The plain fake broker with Kite's one behavioural difference modelled: a stop that is already through the
     market exits immediately (instead of resting)."""
 
-    def place_stop(self, is_buy, size, trigger_px, limit_px):
-        if (not is_buy) and self.hl.price <= trigger_px:
+    def place_stop(self, size, trigger_px, limit_px):
+        if self.hl.price <= trigger_px:
             return self.place_limit(False, size, limit_px, reduce_only=True)
-        return super().place_stop(is_buy, size, trigger_px, limit_px)
+        return super().place_stop(size, trigger_px, limit_px)
 
 
 def trader_world(kind, hist, cfg, clock):
@@ -237,7 +235,6 @@ def trader_world(kind, hist, cfg, clock):
         kite, b = None, NSEFakeBroker(hl)
     tr = Trader(b, cfg, Venue(tick=0.05), now=clock.time,
                 today=lambda: datetime.fromtimestamp(clock.t, tz=timezone.utc).strftime("%Y-%m-%d"))
-    tr.rs_direction = "LONG"
     return D.World(hl, clock, tr, kind), kite
 
 

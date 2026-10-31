@@ -1,4 +1,4 @@
-"""Pure strategy rules - ported 1:1 from `ema_9_21_50_stocks_crypto_1day_1hour.py`.
+"""Pure strategy rules - LONG-ONLY, ported from `ema_9_21_50_stocks_crypto_1day_1hour.py`.
 
 Function names mirror the live bot's methods so each can be diffed against the original:
 
@@ -16,13 +16,14 @@ Function names mirror the live bot's methods so each can be diffed against the o
     adr_pct                    _compute_adr_pct / _adr_pct_from_daily
     nday_return_frac           _nday_return_frac
     add_size_pct               _add_size_pct
+
+The original's short side (bearish ribbon, mirrored exits, laggards) is not part of this port.
 """
 from __future__ import annotations
 
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 LONG = "LONG"
-SHORT = "SHORT"
 BANDS = ("EMA9", "EMA21", "EMA50")
 _BAND = {"ema9": "EMA9", "ema21": "EMA21", "ema50": "EMA50"}
 
@@ -65,13 +66,12 @@ def nday_return_frac(closes_done: Sequence[float], n: int) -> Optional[float]:
 
 # ───────────────────────────── exits ─────────────────────────────
 
-def weak_run_decision(closes, period, is_long, max_closes):
+def weak_run_decision(closes, period, max_closes):
     """Lower-close exit decision from COMPLETED closes (oldest -> newest).
 
-    A "weak run" = the consecutive latest closes on the wrong side of the `period` EMA
-    (LONG: below, SHORT: above).  Inside a run, exit on the first close WORSE than the one
-    before it (LONG: lower, SHORT: higher); a close back across the EMA ends the run (no exit).
-    A run of `max_closes` closes with no worse close also exits (time limit).
+    A "weak run" = the consecutive latest closes BELOW the `period` EMA.  Inside a run, exit on the first close
+    LOWER than the one before it; a close back above the EMA ends the run (no exit).  A run of `max_closes`
+    closes with no lower close also exits (time limit).
     Returns (exit, run_length, kind, close_now, close_prev); kind in {"lower_close","time_limit",""}.
     """
     n = len(closes)
@@ -84,102 +84,96 @@ def weak_run_decision(closes, period, is_long, max_closes):
         ema = p * k + ema * (1 - k)
         series.append(ema)
     run, i = 0, n - 1
-    while i >= period - 1 and ((closes[i] < series[i]) if is_long else (closes[i] > series[i])):
+    while i >= period - 1 and closes[i] < series[i]:
         run += 1
         i -= 1
     if run == 0:
         return False, 0, "", None, None
     start = n - run
     for j in range(start + 1, n):
-        if (closes[j] < closes[j - 1]) if is_long else (closes[j] > closes[j - 1]):
+        if closes[j] < closes[j - 1]:
             return True, run, "lower_close", closes[j], closes[j - 1]
     if run >= max_closes:
         return True, run, "time_limit", closes[-1], closes[-2] if n > 1 else None
     return False, run, "", None, None
 
 
-def check_exit(is_long: bool, closes_done: Sequence[float], e9, e21, e50,
-               exit_mode: str, exit_profit_2closes: str, max_closes: int,
-               ema_fast=9, ema_mid=21, ema_slow=50) -> Optional[str]:
+def check_exit(closes_done: Sequence[float], e9, e21, e50, exit_mode: str, exit_profit_2closes: str,
+               max_closes: int, ema_fast=9, ema_mid=21, ema_slow=50) -> Optional[str]:
     """`_check_exit` on completed-candle ("done") EMAs.  Returns the exit reason or None.
 
     1) lower-close rule on the reference EMA (exit_profit_2closes), in profit AND loss;
     2) ribbon flip per exit_mode.
     """
-    side = "below" if is_long else "above"
     period = {"ema50": ema_slow, "ema21": ema_mid, "ema9": ema_fast}.get(str(exit_profit_2closes).lower())
     if period and closes_done:
-        trig, run, kind, c_now, c_prev = weak_run_decision(closes_done, period, is_long, max_closes)
+        trig, run, kind, c_now, c_prev = weak_run_decision(closes_done, period, max_closes)
         if trig:
             ref = str(exit_profit_2closes).upper()
             if kind == "lower_close":
-                what = "lower" if is_long else "higher"
-                return f"{what} close while {side} {ref} ({c_now:.2f} vs previous {c_prev:.2f}, {run} closes {side} {ref})"
-            return f"{run} closes {side} {ref} without recovering (time limit {max_closes})"
+                return f"lower close while below {ref} ({c_now:.2f} vs previous {c_prev:.2f}, {run} closes below {ref})"
+            return f"{run} closes below {ref} without recovering (time limit {max_closes})"
 
     mode = str(exit_mode).strip().lower()
     if mode == "ema9_ema50":
         if e9 is None or e50 is None:
             return None
-        flipped = (e9 <= e50) if is_long else (e9 >= e50)
+        flipped = e9 <= e50
     elif mode == "ema9_ema21":
         if e9 is None or e21 is None:
             return None
-        flipped = (e9 <= e21) if is_long else (e9 >= e21)
+        flipped = e9 <= e21
     else:  # "ema9_ema21_ema50" - full ribbon
         if e9 is None or e21 is None or e50 is None:
             return None
-        flipped = (e9 <= e21 <= e50) if is_long else (e9 >= e21 >= e50)
+        flipped = e9 <= e21 <= e50
     return f"{mode} flip" if flipped else None
 
 
 # ───────────────────────────── entries ─────────────────────────────
 
-def raw_setup(e9, e21, e50, enable_shorts: bool,
-              band_for: Callable[[str], str]) -> Tuple[Optional[str], Optional[str], Optional[float]]:
-    """(direction, band, limit_price) from the LIVE ribbon alone, else (None, None, None).
+def raw_setup(e9, e21, e50, band: str) -> Tuple[Optional[str], Optional[str], Optional[float]]:
+    """(LONG, band, limit_price) when the LIVE ribbon is stacked up (EMA9 >= EMA21 >= EMA50), else (None,)*3.
     The full 3-EMA ribbon is required."""
     if e9 is None or e21 is None or e50 is None:
         return None, None, None
-    if e9 >= e21 >= e50:
-        direction = LONG
-    elif enable_shorts and e9 <= e21 <= e50:
-        direction = SHORT
-    else:
+    if not (e9 >= e21 >= e50):
         return None, None, None
-    band = band_for(direction)
-    return direction, band, {"EMA9": e9, "EMA21": e21, "EMA50": e50}[band]
+    return LONG, band, {"EMA9": e9, "EMA21": e21, "EMA50": e50}[band]
 
 
-def closed_candle_confirms(direction, closed_close, e9, e21, e50, band) -> bool:
-    """The LAST COMPLETED candle must have closed beyond the BAND EMA and every SLOWER EMA."""
+def closed_candle_confirms(closed_close, e9, e21, e50, band) -> bool:
+    """The LAST COMPLETED candle must have closed above the BAND EMA and every SLOWER EMA."""
     vals = {"EMA9": e9, "EMA21": e21, "EMA50": e50}
     idx = BANDS.index(band) if band in BANDS else 0
     refs = [vals[k] for k in BANDS[idx:]]
     if any(r is None for r in refs) or not closed_close or closed_close <= 0:
         return False
-    return all(closed_close > r for r in refs) if direction == LONG else all(closed_close < r for r in refs)
+    return all(closed_close > r for r in refs)
 
 
-def would_fill_immediately(direction, limit_price, live_price) -> bool:
-    """A resting pullback limit must sit BELOW the market for a LONG (ABOVE for a SHORT)."""
+def would_fill_immediately(limit_price, live_price) -> bool:
+    """A resting pullback buy-limit must sit BELOW the market; at/above it, it would fill at market."""
     if not live_price or live_price <= 0:
         return False
-    return live_price <= limit_price if direction == LONG else live_price >= limit_price
+    return live_price <= limit_price
 
 
-def daily_ribbon_confirms(direction, e9, e21, e50) -> bool:
-    """Daily EMA9>EMA21>EMA50 (mirror for shorts); falls back to EMA9 vs EMA21 if EMA50 is not
-    available yet; fails if EMA21 is unavailable."""
+def daily_ribbon_confirms(e9, e21, e50) -> bool:
+    """Daily EMA9 > EMA21 > EMA50; falls back to EMA9 > EMA21 if EMA50 is not available yet; fails if EMA21 is
+    unavailable."""
     if e9 is None or e21 is None:
         return False
     if e50 is not None:
-        return (e9 > e21 > e50) if direction == LONG else (e9 < e21 < e50)
-    return (e9 > e21) if direction == LONG else (e9 < e21)
+        return e9 > e21 > e50
+    return e9 > e21
 
 
 def ribbon_ok(e9, e21, e50) -> bool:
-    """Selection-stage pre-filter: the DAILY ribbon is monotonically stacked in EITHER direction."""
+    """Selection-stage pre-filter: the DAILY ribbon is monotonically stacked.
+
+    Kept exactly as in the original, which accepts a stack in EITHER direction here (a bearish stack can never
+    pass the later long entry gates, but it does stay on the watchlist)."""
     if e9 is None or e21 is None:
         return False
     if e50 is not None:
@@ -188,39 +182,38 @@ def ribbon_ok(e9, e21, e50) -> bool:
 
 
 def near_extreme_stats(done_closes: Sequence[float], lookback: int):
-    """(last_close, highest_close, lowest_close, n) over the last `lookback` COMPLETED closes."""
+    """(last_close, highest_close, n) over the last `lookback` COMPLETED closes; None if fewer than 2."""
     done = list(done_closes)[-lookback:]
     if len(done) < 2:
         return None
-    return done[-1], max(done), min(done), len(done)
+    return done[-1], max(done), len(done)
 
 
-def near_extreme_dist(direction, last, hi, lo) -> float:
-    if direction == LONG:
-        return (hi - last) / hi if hi > 0 else 0.0
-    return (last - lo) / lo if lo > 0 else 0.0
+def near_extreme_dist(last, hi) -> float:
+    """How far the last close sits below the recent closing high (fraction)."""
+    return (hi - last) / hi if hi > 0 else 0.0
 
 
-def limit_extension_pct(direction, hi, lo, limit_price) -> float:
+def limit_extension_pct(hi, limit_price) -> float:
+    """How far the recent closing high sits above the entry limit (fraction)."""
     if limit_price <= 0:
         return 0.0
-    if direction == LONG:
-        return hi / limit_price - 1.0
-    return (limit_price - lo) / limit_price
+    return hi / limit_price - 1.0
 
 
 def lower_high_stats(closes_done: Sequence[float], recent_days: int, prior_days: int):
-    """(recent_high, prior_high, recent_low, prior_low); None if not enough history."""
+    """(recent_high, prior_high); None if not enough history."""
     if len(closes_done) < recent_days + prior_days:
         return None
     recent = closes_done[-recent_days:]
     prior = closes_done[-(recent_days + prior_days):-recent_days]
-    return max(recent), max(prior), min(recent), min(prior)
+    return max(recent), max(prior)
 
 
-def lower_high_fails(direction, stats) -> bool:
-    rh, ph, rl, pl = stats
-    return (rh < ph) if direction == LONG else (rl > pl)
+def lower_high_fails(stats) -> bool:
+    """True when the recent high is BELOW the prior high (a lower high = failed bounce)."""
+    rh, ph = stats
+    return rh < ph
 
 
 # ───────────────────────────── sizing ─────────────────────────────

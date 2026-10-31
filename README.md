@@ -11,7 +11,7 @@ python -m indian_stocks universe --universe nifty500     # candidate list (NSE i
 python -m indian_stocks fetch    --universe nifty500     # download + cache daily candles
 python -m indian_stocks scan     --universe nifty500     # today's watchlist + entry limits, stops, TP1
 
-python -m pytest                                         # 134 tests, no network needed
+python -m pytest                                         # 130 tests, no network needed
 ```
 
 Ported from
@@ -25,7 +25,7 @@ Ported from
 |---|---|---|
 | `indian_stocks/config.py` | every parameter (`StrategyConfig`) | module constants + `VENUE_CFG["stocks"]` |
 | `indian_stocks/rules.py` | pure rule functions | `calculate_ema`, `_weak_run_decision`, `_check_exit`, `_raw_setup`, `_closed_candle_confirms`, `_daily_ribbon_confirms`, `_would_fill_immediately`, near-high / extension / lower-high helpers, `_add_size_pct` |
-| `indian_stocks/selection.py` | `build_watchlist` (the whole pipeline: filters, RS ranking, `rs_top_n` caps, leader/laggard rules, ordering) + `select_symbol` + benchmark regime | `_refresh_stocks`, `_update_market_regime` |
+| `indian_stocks/selection.py` | `build_watchlist` (the whole pipeline: filters, RS ranking, `rs_top_n` cap, ordering) + `select_symbol` + benchmark regime | `_refresh_stocks`, `_update_market_regime` |
 | `indian_stocks/trader.py` | **`Trader`** - the per-stock decision engine: one `check_strategy()` == one poll of the original (stop/fill detection, restart-sync, exit check, TP2, scale-in, entry limit). Broker-agnostic (`Broker` + `Venue` interfaces) | `EMAPullbackTrader` |
 | `indian_stocks/position.py` | stop levels, TP1/TP2, breakeven, stop re-basing after an add, add gates and sizes | `_on_entry_limit_filled`, `_place_tp_for_position`, `_tp2_target`, `check_tp_filled`, `_on_additional_filled`, `_maintain_additional_limit` gates |
 | `indian_stocks/entry.py` | the entry gate stack | `_select_setup`, `_maintain_entry_limit` |
@@ -54,7 +54,7 @@ sel.ok, sel.direction, sel.reason          # on the watchlist? LONG leader? or w
 |---|---|---|
 | 1 | Volume floor — traded value of the last completed day | ≥ ₹4.5 crore (= the original's $500k × ₹90) |
 | 2 | ADR floor — mean(high/low)−1 over 14 completed daily candles | ≥ 4 % |
-| 3 | Relative strength — 30-day return minus Nifty 50's | ≥ +10 pts → **LONG leader** (≤ −10 pts → SHORT laggard, only if shorts are on). RS also **locks the side** for every later entry |
+| 3 | Relative strength — 30-day return minus Nifty 50's | ≥ +10 pts (a "leader"; the optional `rs_top_n_long` cap is applied here, before the later filters) |
 | 4 | Daily ribbon — live daily EMA9/21/50 monotonically stacked | either direction |
 | 5 | Near-the-high — last close vs 30-day closing high | within 10 % |
 | 6 | Recent trend — A: 10-day return beats the benchmark's · B: EMA21 up ≥ 1 % over 5 days | |
@@ -66,7 +66,7 @@ Optional benchmark regime gate (Nifty 50 vs its EMA21) — off by default, as in
 **Entry** — rest a **limit on the live EMA9** only if: live EMA9 ≥ EMA21 ≥ EMA50 · RS side agrees · daily ribbon
 agrees · the last completed close is above EMA9/21/50 · near-high ≤ 10 % · the 30-day closing high is ≤ 25 % above
 the limit · no lower high · the live price is still *above* the limit (otherwise it would fill at market).
-One entry per stock per day. Size ₹9 lakh long (= $10,000) / ₹2.25 lakh short (= $2,500).
+One entry per stock per day. Size ₹9 lakh (= the original's $10,000).
 
 **Exit** — evaluated once per completed candle:
 1. **Lower-close rule on EMA9**, in profit *or* loss: once closes are below EMA9, exit on the first close *lower*
@@ -88,7 +88,7 @@ sized 50 → 40 → 30 → 20 → 10 % (floor) of the initial position, max 10; 
 |---|---|
 | USD sizes / USD volume floor | INR at `USD_INR = 90` (`config.py`) |
 | 5× leverage | `leverage = 1.0` (NSE cash delivery) |
-| `ENABLE_SHORTS = False` | same, **off** — NSE cash cannot hold an overnight short. The mirror logic is implemented and tested |
+| short side (`ENABLE_SHORTS`, laggards, mirrored exits, `*_short` settings) | **removed** — this is a long-only port; NSE cash cannot hold an overnight short. The original is therefore only comparable with `ENABLE_SHORTS = False` |
 | S&P 500 benchmark | Nifty 50 (you supply the series) |
 | 24/7 candles | NSE session candles (09:15–15:30 IST) in `frames.py` |
 | Shipped `signal_interval = "1d"` (file/branch name says 1h) | `1d` default, kept as a config field |
@@ -116,7 +116,6 @@ How Hyperliquid's order model maps onto Zerodha delivery (CNC) - this is where Z
 | reduce-only stop-market trigger | **GTT** (single) SELL: when LTP falls to the trigger Kite places a LIMIT sell at trigger x 0.95 (the original's own cap). Regular orders cannot rest overnight, GTT can |
 | reduce-only TP1 / TP2 limits | **GTT** SELL at the target price |
 | market close | LIMIT SELL, validity IOC, 3 % through the price (as the original); success is read back from the order book |
-| shorts | **not possible** (delivery). The adapter raises instead of translating them |
 
 Things to know before trusting it:
 * **A GTT stop is a stop-*limit*.** A gap down of more than 5 % through the trigger can leave the order unfilled, and an
@@ -156,7 +155,7 @@ would be rested, with its limit, −10 % stop and TP1.
 
 ## Tests
 
-`python -m pytest` — 134 tests (~2 min; the oracle tests need the original file: set `EMA_BOT_PATH`, they skip if it is absent).
+`python -m pytest` — 130 tests (~2 min; the oracle tests need the original file: set `EMA_BOT_PATH`, they skip if it is absent).
 
 * **Parity with the original** (`tests/test_parity.py`): the original bot's `calculate_ema`, `_weak_run_decision`,
   `_raw_setup`, `_closed_candle_confirms`, `_daily_ribbon_confirms` and the whole `_check_exit` ladder are
@@ -176,7 +175,7 @@ real `EMAPullbackTrader.check_strategy()` and `EMAPullbackBot._refresh_stocks()`
 run on identical fake exchanges with identical candles and price paths (4 polls/day, or 30-minute polls on 1h/4h/1d
 candles). After **every poll** the resting orders (side, size, price, reduce-only, trigger), the position and ~20
 trader fields (adds, TP flags, stop price, pending orders, tier stops, same-day gates) must be identical. Families:
-default stocks config, gaps through stops, tiered stops, shorts, both directions, `stop_to_new_avg_after_add`,
+default stocks config (original run with shorts OFF), gaps through stops, tiered stops, `stop_to_new_avg_after_add`,
 breakeven off, entry/pyramid on EMA21/EMA50, all exit modes x lower-close references, filters off, adds-heavy
 config, TP off, long limit-refresh, regime toggling, watchlist block / drawdown pause, partial fills, restart-sync
 (no stop / valid / wrong-side / duplicate stops, an already-profitable position), and 1h-signal / 1h- and 4h-pyramid
@@ -184,8 +183,9 @@ timeframes. Each family also asserts that it really exercised what it targets (e
 filled).
 
 **Selection** (`tests/test_oracle_selection.py`): the original `_refresh_stocks` and `build_watchlist` get the same
-candles and config (60 random universes/configs, benchmark sometimes missing, young stocks, corrupt feeds, plus a
-leader/laggard-overlap case) and must return the same **ordered** watchlist with the same RS sides.
+candles and config (60 random universes/configs, benchmark sometimes missing, young stocks, corrupt feeds) and must
+return the same **ordered** watchlist. RS-off mode is not compared: there the original decides per stock from its EMAs
+whether to apply long or short filters, whereas the port treats every stock as a long candidate.
 
 **Primitives** (`tests/test_parity.py`): EMA, lower-close rule, exit ladder, setup, confirmations, helpers - original
 functions executed side by side on thousands of random inputs.

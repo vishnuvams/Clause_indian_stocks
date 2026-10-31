@@ -1,9 +1,11 @@
+import dataclasses
+
 import numpy as np
 
 from indian_stocks import rules
 from indian_stocks.config import StrategyConfig
 from indian_stocks.frames import Frame
-from indian_stocks.selection import regime_allowed, select_symbol
+from indian_stocks.selection import longs_allowed, select_symbol
 from tests.helpers import flat, make_df, trend
 
 CFG = StrategyConfig()
@@ -19,54 +21,50 @@ def test_add_size_sequence():
 def test_weak_run_examples():
     # LONG, EMA3: price falls below the EMA, the 2nd closing is lower than the 1st -> lower-close exit
     closes = [10, 10, 10, 10, 10, 9, 8.5]
-    trig, run, kind, now, prev = rules.weak_run_decision(closes, 3, True, 3)
+    trig, run, kind, now, prev = rules.weak_run_decision(closes, 3, 3)
     assert (trig, kind, now, prev) == (True, "lower_close", 8.5, 9)
     # a close back above the EMA ends the run: no exit
     closes = [10, 10, 10, 10, 9, 11]
-    assert rules.weak_run_decision(closes, 3, True, 3)[0] is False
+    assert rules.weak_run_decision(closes, 3, 3)[0] is False
     # single close below the EMA is not an exit yet (needs a lower close or the time limit)
     closes = [10, 10, 10, 10, 10, 9.9]
-    assert rules.weak_run_decision(closes, 3, True, 3)[0] is False
-    # SHORT mirror
-    assert rules.weak_run_decision([10, 10, 10, 10, 10, 11, 11.5], 3, False, 3)[2] == "lower_close"
+    assert rules.weak_run_decision(closes, 3, 3)[0] is False
 
 
 def test_weak_run_time_limit():
     # three closes below the EMA, each HIGHER than the previous (recovering) -> only the time limit fires
     closes = [10] * 10 + [8.0, 8.1, 8.2]
-    trig, run, kind, *_ = rules.weak_run_decision(closes, 3, True, 3)
+    trig, run, kind, *_ = rules.weak_run_decision(closes, 3, 3)
     assert (trig, kind, run) == (True, "time_limit", 3)
-    assert rules.weak_run_decision(closes[:-1], 3, True, 3)[0] is False
+    assert rules.weak_run_decision(closes[:-1], 3, 3)[0] is False
 
 
 def test_ribbon_and_daily_gates():
     assert rules.ribbon_ok(3, 2, 1) and rules.ribbon_ok(1, 2, 3)
     assert not rules.ribbon_ok(2, 3, 1) and not rules.ribbon_ok(None, 2, 1)
     assert rules.ribbon_ok(2, 1, None) and not rules.ribbon_ok(1, 1, None)       # young stock: 2-EMA test
-    assert rules.daily_ribbon_confirms("LONG", 3, 2, 1) and not rules.daily_ribbon_confirms("LONG", 3, 3, 1)
-    assert rules.daily_ribbon_confirms("SHORT", 1, 2, 3)
-    assert rules.daily_ribbon_confirms("LONG", 3, 2, None) and not rules.daily_ribbon_confirms("LONG", 3, None, 1)
+    assert rules.daily_ribbon_confirms(3, 2, 1) and not rules.daily_ribbon_confirms(3, 3, 1)
+    assert not rules.daily_ribbon_confirms(1, 2, 3)                          # a bearish stack never confirms a long
+    assert rules.daily_ribbon_confirms(3, 2, None) and not rules.daily_ribbon_confirms(3, None, 1)
 
 
-def test_raw_setup_requires_full_ribbon_and_respects_shorts():
-    band = lambda d: "EMA21" if d == "SHORT" else "EMA9"
-    assert rules.raw_setup(3, 2, 1, False, band) == ("LONG", "EMA9", 3)
-    assert rules.raw_setup(1, 2, 3, False, band) == (None, None, None)           # long-only
-    assert rules.raw_setup(1, 2, 3, True, band) == ("SHORT", "EMA21", 2)
-    assert rules.raw_setup(3, 2, None, True, band) == (None, None, None)
+def test_raw_setup_requires_a_full_bullish_ribbon():
+    assert rules.raw_setup(3, 2, 1, "EMA9") == ("LONG", "EMA9", 3)
+    assert rules.raw_setup(3, 2, 1, "EMA21") == ("LONG", "EMA21", 2)
+    assert rules.raw_setup(1, 2, 3, "EMA9") == (None, None, None)               # bearish ribbon: nothing to buy
+    assert rules.raw_setup(3, 2, None, "EMA9") == (None, None, None)            # too young for EMA50
 
 
 def test_do_not_chase():
-    assert rules.would_fill_immediately("LONG", 100, 99) and rules.would_fill_immediately("LONG", 100, 100)
-    assert not rules.would_fill_immediately("LONG", 100, 101)
-    assert rules.would_fill_immediately("SHORT", 100, 101) and not rules.would_fill_immediately("SHORT", 100, 99)
+    assert rules.would_fill_immediately(100, 99) and rules.would_fill_immediately(100, 100)
+    assert not rules.would_fill_immediately(100, 101)
 
 
 def test_closed_candle_confirms_band_logic():
     # band EMA21 only needs a close above EMA21 and EMA50 (price may sit under EMA9 on a pullback)
-    assert rules.closed_candle_confirms("LONG", 105, 110, 100, 90, "EMA21")
-    assert not rules.closed_candle_confirms("LONG", 105, 110, 100, 90, "EMA9")
-    assert not rules.closed_candle_confirms("LONG", 95, 110, 100, 90, "EMA21")
+    assert rules.closed_candle_confirms(105, 110, 100, 90, "EMA21")
+    assert not rules.closed_candle_confirms(105, 110, 100, 90, "EMA9")
+    assert not rules.closed_candle_confirms(95, 110, 100, 90, "EMA21")
 
 
 # ───────────────────────── selection ─────────────────────────
@@ -107,18 +105,17 @@ def test_rs_floor_benchmark_matters():
     assert not r.ok and r.reason.startswith("RS")
 
 
-def test_laggard_not_selected_when_shorts_off_and_selected_when_on():
+def test_a_laggard_is_never_selected():
     n = 200
     closes = [100 * (0.99 ** i) for i in range(n)]
     opens = [100.0] + closes[:-1]
     df = make_df(opens, [max(o, c) * 1.025 for o, c in zip(opens, closes)],
                  [min(o, c) * 0.975 for o, c in zip(opens, closes)], closes, volume=100_000_000)
     D, B = Frame.from_df(df, None), Frame.from_df(flat(n), None)
-    off = _sel(D, B)
-    assert not off.ok and off.reason.startswith("RS")          # a laggard is simply not a long candidate
-    import dataclasses
-    r = _sel(D, B, dataclasses.replace(CFG, enable_shorts=True, near_high_max_pct=0.0))
-    assert r.ok and r.direction == "SHORT"
+    r = _sel(D, B)
+    assert not r.ok and r.reason.startswith("RS")              # long-only: a laggard is simply not a candidate
+    r = _sel(D, B, dataclasses.replace(CFG, near_high_max_pct=0.0, rs_min_pct_long=-100.0))
+    assert r.direction in (None, "LONG")                       # even when the RS bar is lowered there is no SHORT side
 
 
 def test_ribbon_filter_drops_tangled_daily_ema():
@@ -156,12 +153,11 @@ def test_lower_high_and_near_high_filters():
 
 
 def test_regime_follows_benchmark_vs_ema21():
-    import dataclasses
     cfg = dataclasses.replace(CFG, regime_filter_enabled=True)
     up, dn = Frame.from_df(trend(100), None), Frame.from_df(make_df(
         [100 * 0.99 ** i for i in range(100)], [101 * 0.99 ** i for i in range(100)],
         [99 * 0.99 ** i for i in range(100)], [100 * 0.99 ** (i + 1) for i in range(100)]), None)
-    assert regime_allowed(up, 99, cfg, None) == "LONG"
-    assert regime_allowed(dn, 99, cfg, None) == "SHORT"
-    assert regime_allowed(up, 99, CFG, "SHORT") is None                   # filter off
-    assert regime_allowed(None, 99, cfg, "LONG") is None
+    assert longs_allowed(up, 99, cfg, None) is True
+    assert longs_allowed(dn, 99, cfg, None) is False
+    assert longs_allowed(up, 99, CFG, False) is None                      # filter off
+    assert longs_allowed(None, 99, cfg, True) is None

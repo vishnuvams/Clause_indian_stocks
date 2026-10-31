@@ -42,15 +42,15 @@ class FakeBroker:
         return self._res(self.hl.order(self.hl.coin, is_buy, size, price, {"limit": {"tif": "Gtc"}},
                                        reduce_only=reduce_only))
 
-    def place_stop(self, is_buy, size, trigger_px, limit_px):
-        return self._res(self.hl.order(self.hl.coin, is_buy, size, limit_px,
+    def place_stop(self, size, trigger_px, limit_px):
+        return self._res(self.hl.order(self.hl.coin, False, size, limit_px,
                                        {"trigger": {"triggerPx": trigger_px, "isMarket": True, "tpsl": "sl"}},
                                        reduce_only=True))
 
     def cancel(self, oid):
         self.hl.cancel(self.hl.coin, oid)
 
-    def market_close(self, is_long, size, ref_price):
+    def market_close(self, size, ref_price):
         return self.hl.market_close(self.hl.coin, size, ref_price)["status"] == "ok"
 
 
@@ -62,10 +62,7 @@ def cfg_from_kwargs(kw: dict) -> StrategyConfig:
     d = {k: v for k, v in kw.items() if k in CFG_FIELDS}
     if "initial_entry_usd_long" in kw:
         d["initial_entry_inr_long"] = kw["initial_entry_usd_long"]
-    if "initial_entry_usd_short" in kw:
-        d["initial_entry_inr_short"] = kw["initial_entry_usd_short"]
     d.setdefault("initial_entry_inr_long", 900_000.0)
-    d.setdefault("initial_entry_inr_short", 225_000.0)
     if "stop_tiers" in d:
         d["stop_tiers"] = list(d["stop_tiers"])
     return StrategyConfig(**d)
@@ -143,7 +140,6 @@ class Pair:
                 tr = Trader(FakeBroker(hl), cfg, venue, now=clock.time,
                             today=lambda c=clock: __import__("datetime").datetime.fromtimestamp(
                                 c.t, tz=__import__("datetime").timezone.utc).strftime("%Y-%m-%d"))
-                tr.rs_direction = rs_direction
             w = World(hl, clock, tr, name)
             if setup:
                 setup(w)                     # e.g. pre-existing stop orders for restart-sync scenarios
@@ -159,6 +155,13 @@ class Pair:
         for w in self.worlds:
             for k, v in attrs.items():
                 setattr(w.trader, k, v)
+
+    def set_regime(self, blocks_longs: bool):
+        """Benchmark below its EMA21: the original expresses it as regime_allowed="SHORT" (which blocks LONG),
+        the long-only port as a boolean."""
+        orig, port = self.worlds[0].trader, self.worlds[1].trader
+        orig.regime_allowed = "SHORT" if blocks_longs else "LONG"
+        port.regime_blocks_longs = blocks_longs
 
     def _each(self, fn):
         for w in self.worlds:

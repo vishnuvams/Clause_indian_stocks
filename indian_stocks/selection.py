@@ -1,18 +1,17 @@
 """Stock selection - port of `EMAPullbackBot._refresh_stocks` (+ `_update_market_regime`), stage for stage.
+LONG-ONLY: the original's SHORT laggards are not part of this port.
 
 `build_watchlist` takes the whole candidate set and returns the ordered watchlist exactly as the original
-builds it (same stages, same order of stages, same tie-breaking):
+builds it with shorts disabled (same stages, same order of stages, same tie-breaking):
 
     1. volume floor       traded value of the last completed day >= min_turnover_inr
     2. ADR floor          mean(high/low)-1 over the last 14 completed daily candles >= 4 %    (no data => dropped)
     3. relative strength  rs = 30d return - benchmark's 30d return (raw return if no benchmark data)
-                          ranked high -> low;  LONG leaders: rs >= +10 pts (top `rs_top_n_long` if > 0)
-                          SHORT laggards (only if shorts on): rs <= -10 pts (bottom `rs_top_n_short` if > 0);
-                          a stock that is both is a leader.  The cap is applied HERE, i.e. to the ADR
-                          survivors, BEFORE the filters below - so fewer than N can survive.
-                          RS off: no side, ordered by traded value.
-    4. daily ribbon       live daily EMA9/21/50 monotonically stacked (either way)
-    5. near-the-high      last completed close within 10 % of its 30d closing high (SHORT: low)
+                          ranked high -> low; leaders: rs >= +10 pts (top `rs_top_n_long` if > 0).
+                          The cap is applied HERE, i.e. to the ADR survivors, BEFORE the filters below - so
+                          fewer than N can survive.  RS off: every stock is a candidate, ordered by traded value.
+    4. daily ribbon       live daily EMA9/21/50 monotonically stacked
+    5. near-the-high      last completed close within 10 % of its 30d closing high
     6. recent trend       A: 10d return beats the benchmark's (skipped if benchmark data is missing)
                           B: EMA21 up >= 1 % over 5 days
     7. lower-high         highest close of days 1-5 ago not below that of days 6-10 ago
@@ -26,7 +25,7 @@ in-progress candle at its current price `x`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from . import rules
 from .config import StrategyConfig
@@ -36,7 +35,7 @@ from .frames import Frame
 @dataclass
 class Selection:
     ok: bool
-    direction: Optional[str] = None     # RS side (LONG / SHORT) or None when RS is off
+    direction: Optional[str] = None     # "LONG" for a selected stock
     rs: Optional[float] = None          # relative strength, fraction (0.10 = +10 pts)
     adr: Optional[float] = None         # %
     turnover: float = 0.0
@@ -111,10 +110,6 @@ def build_watchlist(cands: Iterable[Candidate], B: Optional[Frame], kb: int, cfg
         m["symbol"] = c.symbol
         rows.append(m)
 
-    def sel(m, **kw):
-        return Selection(True, kw.get("direction"), m.get("rs"), m["adr"], m["turnover"], "selected",
-                         m["e9"], m["e21"], m["e50"], m["symbol"])
-
     # 1. volume floor
     if cfg.min_turnover_inr > 0:
         keep = []
@@ -138,40 +133,26 @@ def build_watchlist(cands: Iterable[Candidate], B: Optional[Frame], kb: int, cfg
                 dropped[m["symbol"]] = f"ADR {m['adr']:.2f}% below {cfg.adr_min_pct:.1f}%"
         rows = keep
 
-    # 3. relative strength -> side (+ ranking, caps)
-    side: Dict[str, Optional[str]] = {}
+    # 3. relative strength (+ ranking, cap)
     bench_rs, bench_recent = _bench_returns(B, kb, cfg)
     if cfg.rs_enabled and rows:
         for m in rows:
             m["rs"] = None if m["raw"] is None else (m["raw"] if bench_rs is None else m["raw"] - bench_rs)
-        for m in rows:
             if m["rs"] is None:
                 dropped[m["symbol"]] = "not enough history for RS"
         ranked = sorted((m for m in rows if m["rs"] is not None), key=lambda m: m["rs"], reverse=True)
-        thr_l, thr_s = cfg.rs_min_pct_long / 100.0, cfg.rs_min_pct_short / 100.0
-        long_ranked = [m for m in ranked if m["rs"] >= thr_l]
-        short_ranked = [m for m in ranked if m["rs"] <= -thr_s]
+        thr = cfg.rs_min_pct_long / 100.0
+        long_ranked = [m for m in ranked if m["rs"] >= thr]
         leaders = long_ranked[:cfg.rs_top_n_long] if cfg.rs_top_n_long > 0 else long_ranked
-        if cfg.enable_shorts:
-            laggards = short_ranked[-cfg.rs_top_n_short:] if cfg.rs_top_n_short > 0 else short_ranked
-        else:
-            laggards = []
-        leader_syms = {m["symbol"] for m in leaders}
-        laggard_syms = {m["symbol"] for m in laggards} - leader_syms
-        side = {s: rules.LONG for s in leader_syms}
-        side.update({s: rules.SHORT for s in laggard_syms})
-        rows = [m for m in ranked if m["symbol"] in leader_syms or m["symbol"] in laggard_syms]
+        keep_syms = {m["symbol"] for m in leaders}
         for m in ranked:
-            if m["symbol"] not in side:
-                dropped[m["symbol"]] = (
-                    f"RS {m['rs'] * 100:+.1f} pts not beyond +{cfg.rs_min_pct_long:.0f}"
-                    + (f" / -{cfg.rs_min_pct_short:.0f}" if cfg.enable_shorts else "")
-                    if (m["rs"] < thr_l and not (cfg.enable_shorts and m["rs"] <= -thr_s))
-                    else "cut by the rs_top_n cap")
+            if m["symbol"] not in keep_syms:
+                dropped[m["symbol"]] = (f"RS {m['rs'] * 100:+.1f} pts not beyond +{cfg.rs_min_pct_long:.0f}"
+                                        if m["rs"] < thr else "cut by the rs_top_n cap")
+        rows = [m for m in ranked if m["symbol"] in keep_syms]
     else:
         for m in rows:
             m["rs"] = None
-            side[m["symbol"]] = None
         rows.sort(key=lambda m: m["turnover"], reverse=True)
 
     # 4. daily ribbon
@@ -183,10 +164,6 @@ def build_watchlist(cands: Iterable[Candidate], B: Optional[Frame], kb: int, cfg
             dropped[m["symbol"]] = "daily EMA ribbon not stacked"
     rows = keep
 
-    def direction_of(m):
-        d = side.get(m["symbol"])
-        return d or (rules.LONG if (m["e9"] is not None and m["e21"] is not None and m["e9"] >= m["e21"]) else rules.SHORT)
-
     # 5. near-the-high
     if cfg.near_high_max_pct > 0:
         keep = []
@@ -195,13 +172,12 @@ def build_watchlist(cands: Iterable[Candidate], B: Optional[Frame], kb: int, cfg
             if st is None:
                 keep.append(m)
                 continue
-            d = direction_of(m)
-            dist = rules.near_extreme_dist(d, st[0], st[1], st[2])
+            dist = rules.near_extreme_dist(st[0], st[1])
             if dist <= cfg.near_high_max_pct:
                 keep.append(m)
             else:
-                dropped[m["symbol"]] = (f"{dist * 100:.1f}% from {cfg.near_high_lookback}d closing "
-                                        f"{'high' if d == rules.LONG else 'low'} (limit {cfg.near_high_max_pct * 100:.0f}%)")
+                dropped[m["symbol"]] = (f"{dist * 100:.1f}% from {cfg.near_high_lookback}d closing high "
+                                        f"(limit {cfg.near_high_max_pct * 100:.0f}%)")
         rows = keep
 
     # 6. recent trend: A (recent RS) + B (EMA21 slope)
@@ -209,17 +185,12 @@ def build_watchlist(cands: Iterable[Candidate], B: Optional[Frame], kb: int, cfg
         b_recent = bench_recent if cfg.recent_rs_filter else None
         keep = []
         for m in rows:
-            d = direction_of(m)
-            is_long = d == rules.LONG
             why = []
             if cfg.recent_rs_filter and m["ret_recent"] is not None and b_recent is not None:
-                rel = m["ret_recent"] - b_recent
-                ok = (rel >= cfg.recent_rs_min_pct) if is_long else (rel <= -cfg.recent_rs_min_pct)
-                if not ok:
+                if not (m["ret_recent"] - b_recent >= cfg.recent_rs_min_pct):
                     why.append(f"{cfg.recent_rs_days}d return {m['ret_recent']:+.1f}% vs benchmark {b_recent:+.1f}%")
             if cfg.ema21_rising_filter and m["slope"] is not None:
-                ok = (m["slope"] >= cfg.ema21_slope_min_pct) if is_long else (m["slope"] <= -cfg.ema21_slope_min_pct)
-                if not ok:
+                if not (m["slope"] >= cfg.ema21_slope_min_pct):
                     why.append(f"EMA21 {m['slope']:+.1f}% over {cfg.ema21_slope_days}d")
             if why:
                 dropped[m["symbol"]] = "; ".join(why)
@@ -231,23 +202,23 @@ def build_watchlist(cands: Iterable[Candidate], B: Optional[Frame], kb: int, cfg
     if rows and cfg.lower_high_filter:
         keep = []
         for m in rows:
-            d = direction_of(m)
-            if m["lh"] is None or not rules.lower_high_fails(d, m["lh"]):
+            if m["lh"] is None or not rules.lower_high_fails(m["lh"]):
                 keep.append(m)
             else:
-                dropped[m["symbol"]] = "making lower highs" if d == rules.LONG else "making higher lows"
+                dropped[m["symbol"]] = "making lower highs"
         rows = keep
 
-    return [sel(m, direction=side.get(m["symbol"])) for m in rows], dropped
+    out = [Selection(True, rules.LONG, m.get("rs"), m["adr"], m["turnover"], "selected", m["e9"], m["e21"], m["e50"],
+                     m["symbol"]) for m in rows]
+    return out, dropped
 
 
 def select_symbol(D: Frame, kd: int, x: float, B: Optional[Frame], kb: int, cfg: StrategyConfig,
                   symbol: str = "") -> Selection:
-    """One-stock wrapper around `build_watchlist` (no cross-stock caps apply to a single stock)."""
+    """One-stock wrapper around `build_watchlist` (no cross-stock cap applies to a single stock)."""
     out, dropped = build_watchlist([Candidate(symbol, D, kd, x)], B, kb, cfg)
     if out:
         return out[0]
-    # the dropped reason; recompute cheaply for the numbers a caller may want
     m = _metrics(Candidate(symbol, D, kd, x), cfg) or {}
     bench_rs, _ = _bench_returns(B, kb, cfg)
     rs = None
@@ -257,9 +228,10 @@ def select_symbol(D: Frame, kd: int, x: float, B: Optional[Frame], kb: int, cfg:
                      m.get("e9"), m.get("e21"), m.get("e50"), symbol)
 
 
-def regime_allowed(B: Optional[Frame], kb: int, cfg: StrategyConfig, previous: Optional[str]) -> Optional[str]:
-    """`_update_market_regime`: benchmark close vs its EMA21 -> "LONG" / "SHORT" (None when the
-    filter is off; keeps `previous` inside the buffer or when data is missing)."""
+def longs_allowed(B: Optional[Frame], kb: int, cfg: StrategyConfig, previous: Optional[bool]) -> Optional[bool]:
+    """`_update_market_regime` for a long-only book: benchmark close above its EMA21 -> True (longs allowed),
+    below -> False (longs blocked).  None when the filter is off; keeps `previous` inside the buffer or when
+    data is missing."""
     if not cfg.regime_filter_enabled or B is None:
         return None
     if kb < cfg.regime_ema_period + 1:
@@ -270,7 +242,7 @@ def regime_allowed(B: Optional[Frame], kb: int, cfg: StrategyConfig, previous: O
         return previous
     close, buf = done[-1], cfg.regime_buffer_pct
     if close > ema * (1 + buf):
-        return rules.LONG
+        return True
     if close < ema * (1 - buf):
-        return rules.SHORT
+        return False
     return previous

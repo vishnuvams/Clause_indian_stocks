@@ -1,4 +1,4 @@
-"""`Trader` - the per-stock decision engine, a broker-agnostic port of `EMAPullbackTrader` (original bot).
+"""`Trader` - the per-stock decision engine (LONG-ONLY), a broker-agnostic port of `EMAPullbackTrader`.
 
 Same control flow, same order of operations, same state, same caches.  What it does NOT contain: the
 Hyperliquid SDK, Telegram, trade-log files, printing, rate-limit back-off, sleeps.  All venue I/O goes through
@@ -30,7 +30,7 @@ from typing import Callable, Dict, List, Optional, Protocol, Tuple
 from . import rules
 from .config import StrategyConfig
 
-LONG, SHORT = rules.LONG, rules.SHORT
+LONG = rules.LONG
 
 
 # ───────────────────────────── interfaces ─────────────────────────────
@@ -59,14 +59,16 @@ class Broker(Protocol):
         """All resting orders on this symbol (limits and stop triggers)."""
 
     def place_limit(self, is_buy: bool, size: float, price: float, reduce_only: bool = False):
-        """-> ("resting", oid) | ("filled", None) | None (rejected)"""
+        """BUY entries / scale-ins and reduce-only SELL take-profits -> ("resting", oid) | ("filled", None) | None"""
 
-    def place_stop(self, is_buy: bool, size: float, trigger_px: float, limit_px: float):
-        """reduce-only stop-market trigger -> ("resting", oid) | ("filled", None) | None"""
+    def place_stop(self, size: float, trigger_px: float, limit_px: float):
+        """reduce-only SELL stop: triggers at `trigger_px`, sells down to `limit_px`
+        -> ("resting", oid) | ("filled", None) | None"""
 
     def cancel(self, oid: int) -> None: ...
 
-    def market_close(self, is_long: bool, size: float, ref_price: float) -> bool: ...
+    def market_close(self, size: float, ref_price: float) -> bool:
+        """Sell the whole position now (limit at `ref_price`, which sits below the market)."""
 
 
 @dataclass
@@ -101,7 +103,7 @@ class Trader:
     def __init__(self, broker: Broker, cfg: StrategyConfig, venue: Optional[Venue] = None, *,
                  now: Callable[[], float], today: Callable[[], str] = ist_today,
                  log: Optional[Callable[[str], None]] = None,
-                 initial_entry_long: Optional[float] = None, initial_entry_short: Optional[float] = None):
+                 initial_entry_long: Optional[float] = None):
         self.b = broker
         self.cfg = cfg
         self.venue = venue or Venue(tick=cfg.tick_size)
@@ -125,9 +127,7 @@ class Trader:
         self.signal_interval = cfg.signal_interval
         self.TP_PROFIT_PCT, self.TP_SIZE_PCT, self.TP_STOP_TO_BE = cfg.tp_profit_pct, cfg.tp_size_pct, cfg.tp_stop_to_breakeven
         self.entry_band_label = rules.band_label(cfg.entry_ema)
-        self.entry_band_label_short = rules.band_label(cfg.entry_ema_short, self.entry_band_label)
         self.pyramid_band_label = rules.band_label(cfg.pyramid_ema)
-        self.pyramid_band_label_short = rules.band_label(cfg.pyramid_ema_short, self.pyramid_band_label)
         self.stop_to_new_avg_after_add = bool(cfg.stop_to_new_avg_after_add)
         self.daily_ribbon_confirm = bool(cfg.daily_ribbon_confirm)
         self.near_high_max_pct = max(0.0, float(cfg.near_high_max_pct))
@@ -136,9 +136,7 @@ class Trader:
         self.lower_high_filter = bool(cfg.lower_high_filter)
         self.lh_recent = max(1, int(cfg.lower_high_recent_days))
         self.lh_prior = max(1, int(cfg.lower_high_prior_days))
-        self.ENABLE_SHORTS = cfg.enable_shorts
         self.initial_entry_long = cfg.initial_entry_inr_long if initial_entry_long is None else initial_entry_long
-        self.initial_entry_short = cfg.initial_entry_inr_short if initial_entry_short is None else initial_entry_short
         self.exit_mode = str(cfg.exit_mode).strip().lower()
         _e2c = str(cfg.exit_profit_2closes).strip().lower()
         self.exit_profit_2closes = _e2c if _e2c in ("ema50", "ema21", "ema9") else "off"
@@ -157,8 +155,7 @@ class Trader:
         self._tp2_cache_date = None
 
         # gates set by the orchestrator
-        self.regime_allowed: Optional[str] = None
-        self.rs_direction: Optional[str] = None
+        self.regime_blocks_longs = False        # benchmark below its EMA21 (only when the regime filter is on)
         self._volume_blocked = False
         self.in_scanner = True
 
@@ -202,9 +199,6 @@ class Trader:
         self._last_ema = (None, None, None)
 
     # ═══════════════════════ venue helpers ═══════════════════════
-    def _initial_for(self, direction):
-        return self.initial_entry_long if direction == LONG else self.initial_entry_short
-
     def _stop_pct_for(self, band):
         return self.STOP_PCT_BY_BAND.get(band, self.STOP_PCT_BY_BAND.get("EMA9", 0.05))
 
@@ -230,24 +224,21 @@ class Trader:
             if o.oid:
                 self.b.cancel(o.oid)
 
-    def place_stop_loss_order(self, is_long, size, trigger_price):
+    def place_stop_loss_order(self, size, trigger_price):
         if trigger_price <= 0:
             return None
         size = self.venue.size(abs(size))
         trigger_price = self.venue.price(trigger_price)
-        if is_long:
-            is_buy, limit_price = False, self.venue.price(trigger_price * 0.95)
-        else:
-            is_buy, limit_price = True, self.venue.price(trigger_price * 1.05)
-        res = self.b.place_stop(is_buy, size, trigger_price, limit_price)
+        limit_price = self.venue.price(trigger_price * 0.95)
+        res = self.b.place_stop(size, trigger_price, limit_price)
         if res is None:
             return None
         kind, oid = res
         return oid if kind == "resting" else "filled"
 
-    def _ensure_stop_loss_placed(self, is_long, size, trigger_price, max_attempts=3, track=True):
+    def _ensure_stop_loss_placed(self, size, trigger_price, max_attempts=3, track=True):
         for _ in range(max_attempts):
-            oid = self.place_stop_loss_order(is_long, size, trigger_price)
+            oid = self.place_stop_loss_order(size, trigger_price)
             valid = isinstance(oid, int) or (isinstance(oid, str) and oid not in ("placed", "filled"))
             if valid:
                 if track:
@@ -266,10 +257,10 @@ class Trader:
         self.say(f"STOP PLACEMENT FAILED - position unprotected @ {trigger_price}")
         return None
 
-    def _replace_stop(self, is_long, size, trigger_price):
+    def _replace_stop(self, size, trigger_price):
         self.cancel_all_trigger_orders()
         self.stop_loss_oid = None
-        return self._ensure_stop_loss_placed(is_long, size, trigger_price)
+        return self._ensure_stop_loss_placed(size, trigger_price)
 
     def cancel_stop_loss_order(self):
         if not self.stop_loss_oid or self.stop_loss_oid in ("placed", "filled"):
@@ -316,17 +307,16 @@ class Trader:
         return cancelled
 
     # ---- entry limit ----
-    def _place_entry_limit(self, direction, limit_price, usd_amount, completed_ts, band):
+    def _place_entry_limit(self, limit_price, usd_amount, completed_ts, band):
         self._sweep_non_trigger_limits("pre-entry-limit sweep")
-        is_buy = direction == LONG
         size = self.venue.size(usd_amount / limit_price)
         limit_price = self.venue.price(limit_price)
-        res = self.b.place_limit(is_buy, size, limit_price)
+        res = self.b.place_limit(True, size, limit_price)
         if res is None:
             return None
         kind, oid = res
         self.pending_entry_oid = oid if kind == "resting" else "filled"
-        self.pending_entry_side, self.pending_entry_band, self.pending_entry_price = direction, band, limit_price
+        self.pending_entry_side, self.pending_entry_band, self.pending_entry_price = LONG, band, limit_price
         return self.pending_entry_oid
 
     def _check_entry_limit_filled(self):
@@ -353,17 +343,16 @@ class Trader:
         self._clear_pending_entry()
 
     # ---- add limit ----
-    def _place_additional_limit(self, direction, limit_price, usd_amount, band):
+    def _place_additional_limit(self, limit_price, usd_amount, band):
         self._sweep_non_trigger_limits("pre-additional-limit sweep")
-        is_buy = direction == LONG
         size = self.venue.size(usd_amount / limit_price)
         limit_price = self.venue.price(limit_price)
-        res = self.b.place_limit(is_buy, size, limit_price)
+        res = self.b.place_limit(True, size, limit_price)
         if res is None:
             return None
         kind, oid = res
         self.pending_add_oid = oid if kind == "resting" else "filled"
-        self.pending_add_side, self.pending_add_band, self.pending_add_price = direction, band, limit_price
+        self.pending_add_side, self.pending_add_band, self.pending_add_price = LONG, band, limit_price
         return self.pending_add_oid
 
     def _check_additional_limit_filled(self):
@@ -386,12 +375,12 @@ class Trader:
         self._clear_pending_add()
 
     # ---- take profits ----
-    def _place_tp_limit(self, is_long, size, tp_price):
+    def _place_tp_limit(self, size, tp_price):
         size = self.venue.size(abs(size))
         tp_price = self.venue.price(tp_price)
         if size <= 0 or tp_price <= 0:
             return None
-        res = self.b.place_limit(not is_long, size, tp_price, reduce_only=True)
+        res = self.b.place_limit(False, size, tp_price, reduce_only=True)
         if res is None:
             return None
         kind, oid = res
@@ -404,12 +393,11 @@ class Trader:
             return
         if self.partial_tp_done or not self.position_type or self.entry_price <= 0:
             return
-        is_long = self.position_type == LONG
-        tp_price = self.entry_price * (1 + self.TP_PROFIT_PCT) if is_long else self.entry_price * (1 - self.TP_PROFIT_PCT)
+        tp_price = self.entry_price * (1 + self.TP_PROFIT_PCT)
         tp_size = self.venue.size(self.position_size * self.TP_SIZE_PCT)
         if self.tp_oid:
             self._cancel_tp_limit()
-        self._place_tp_limit(is_long, tp_size, tp_price)
+        self._place_tp_limit(tp_size, tp_price)
 
     def _cancel_tp_limit(self):
         oid = self.tp_oid
@@ -444,21 +432,20 @@ class Trader:
             self._tp2_cache_date = today
         return self._tp2_cache
 
-    def _tp2_target(self, is_long):
+    def _tp2_target(self):
         data = self._tp2_inputs()
         if not data or data[0] is None or data[1] is None:
             return None
         ema50, adr = data
-        ext = self.EMA50_TP_MULT * adr / 100.0
-        target = ema50 * (1.0 + ext) if is_long else ema50 * (1.0 - ext)
+        target = ema50 * (1.0 + self.EMA50_TP_MULT * adr / 100.0)
         return target if target > 0 else None
 
-    def _place_tp2_limit(self, is_long, size, price):
+    def _place_tp2_limit(self, size, price):
         size = self.venue.size(abs(size))
         price = self.venue.price(price)
         if size <= 0 or price <= 0:
             return None
-        res = self.b.place_limit(not is_long, size, price, reduce_only=True)
+        res = self.b.place_limit(False, size, price, reduce_only=True)
         if res is None:
             return None
         kind, oid = res
@@ -476,11 +463,10 @@ class Trader:
         today = self._today()
         if self.tp2_oid and self._tp2_placed_date == today:
             return
-        is_long = self.position_type == LONG
-        target = self._tp2_target(is_long)
+        target = self._tp2_target()
         if target is None:
             return
-        beyond = bool(live_price) and ((live_price >= target) if is_long else (live_price <= target))
+        beyond = bool(live_price) and live_price >= target
         if beyond and not self._tp1_filled_here:
             return
         current = abs(self.get_position().get("size") or 0)
@@ -493,12 +479,12 @@ class Trader:
                 self._tp2_placed_date = today
                 return
             self._cancel_tp2_limit()
-        self._place_tp2_limit(is_long, size, target)
+        self._place_tp2_limit(size, target)
 
     def _resize_stop_to_remaining(self, remaining):
         if self._tiers_active or remaining <= 0 or not self.emergency_stop_price or not self.position_type:
             return
-        self._replace_stop(self.position_type == LONG, remaining, self.emergency_stop_price)
+        self._replace_stop(remaining, self.emergency_stop_price)
 
     def check_tp2_filled(self):
         if not self.position_type or not self.tp2_oid or self.tp2_done:
@@ -566,7 +552,7 @@ class Trader:
         self.position_size = remaining_size
         if self.TP_STOP_TO_BE and self.position_size > 0:
             self.emergency_stop_price = self.entry_price
-            self._replace_stop(self.position_type == LONG, self.position_size, self.emergency_stop_price)
+            self._replace_stop(self.position_size, self.emergency_stop_price)
         else:
             self._resize_stop_to_remaining(self.position_size)
         return True
@@ -603,12 +589,11 @@ class Trader:
             return False
         cur_size = abs(self.get_position().get("size", 0))
         if cur_size >= self.position_size - 1e-12:
-            is_long = self.position_type == LONG
             for t in missing:
                 self._tier_stop_oids.remove(t)
-                trig = self.entry_price * (1 - t["pct"]) if is_long else self.entry_price * (1 + t["pct"])
+                trig = self.entry_price * (1 - t["pct"])
                 tier_size = self.venue.size(self._tier_base_size * t["frac"])
-                new_oid = self._ensure_stop_loss_placed(is_long, tier_size, trig, track=False)
+                new_oid = self._ensure_stop_loss_placed(tier_size, trig, track=False)
                 if new_oid:
                     self._tier_stop_oids.append({"oid": new_oid, "pct": t["pct"], "frac": t["frac"]})
             return False
@@ -651,7 +636,7 @@ class Trader:
                     self.emergency_stop_price = float(etrig)
                 return
         if self.entry_price and self.emergency_stop_price:
-            self._ensure_stop_loss_placed(self.position_type == LONG, self.position_size, self.emergency_stop_price)
+            self._ensure_stop_loss_placed(self.position_size, self.emergency_stop_price)
 
     def _enforce_single_orders(self):
         def cancel_extras(group):
@@ -684,21 +669,20 @@ class Trader:
                 self.tp_oid = kept_tp
 
     # ---- close ----
-    def place_close_order(self, is_long, size):
+    def place_close_order(self, size):
         candles = self.get_candles("1m", 1)
         if not candles:
             return False
-        price = float(candles[-1]["c"]) * (0.97 if is_long else 1.03)
-        return bool(self.b.market_close(is_long, self.venue.size(abs(size)), self.venue.price(price)))
+        price = float(candles[-1]["c"]) * 0.97
+        return bool(self.b.market_close(self.venue.size(abs(size)), self.venue.price(price)))
 
     def _market_close_position(self, reason, current_price):
         if self.position_type is None:
             return
-        is_long = self.position_type == LONG
         size_to_close = self.position_size
         ok = False
         for _ in range(3):
-            if self.place_close_order(is_long, size_to_close):
+            if self.place_close_order(size_to_close):
                 ok = True
                 break
         if not ok:
@@ -737,15 +721,13 @@ class Trader:
 
     # ═══════════════════════ fills ═══════════════════════
     def _on_entry_limit_filled(self, fill_price, ema9, ema21, ema50):
-        direction = self.pending_entry_side or LONG
-        is_long = direction == LONG
         pos = self.get_position()
-        init = self._initial_for(direction)
+        init = self.initial_entry_long
         size = abs(pos["size"]) if pos["size"] != 0 else (init / fill_price)
         entry = pos["entry"] if pos["entry"] > 0 else fill_price
-        band = self.pending_entry_band or self._infer_band(direction, entry, ema9, ema21, ema50)
+        band = self.pending_entry_band or self._infer_band(entry, ema9, ema21, ema50)
 
-        self.position_type = direction
+        self.position_type = LONG
         self.position_size = size
         self.entry_price = entry
         self._partial_stop_size = 0.0
@@ -763,7 +745,7 @@ class Trader:
         self._tier_base_size = size
         self._tiers_active = len(self.STOP_TIERS) > 1
         deepest_pct = self.STOP_TIERS[-1][0]
-        self.emergency_stop_price = entry * (1 - deepest_pct) if is_long else entry * (1 + deepest_pct)
+        self.emergency_stop_price = entry * (1 - deepest_pct)
 
         self.cancel_all_trigger_orders()
         self.stop_loss_oid = None
@@ -773,12 +755,12 @@ class Trader:
                 tier_size = self.venue.size(size * frac)
                 if tier_size <= 0:
                     continue
-                trig = entry * (1 - pct) if is_long else entry * (1 + pct)
-                oid = self._ensure_stop_loss_placed(is_long, tier_size, trig, track=False)
+                trig = entry * (1 - pct)
+                oid = self._ensure_stop_loss_placed(tier_size, trig, track=False)
                 if oid:
                     self._tier_stop_oids.append({"oid": oid, "pct": pct, "frac": frac})
         else:
-            self._ensure_stop_loss_placed(is_long, size, self.emergency_stop_price)
+            self._ensure_stop_loss_placed(size, self.emergency_stop_price)
 
         self._place_tp_for_position()
         self._clear_pending_entry()
@@ -787,7 +769,6 @@ class Trader:
         pos = self.get_position()
         new_size = abs(pos["size"]) if pos["size"] != 0 else self.position_size
         new_avg = pos["entry"] if pos["entry"] > 0 else self.entry_price
-        is_long = self.position_type == LONG
         self.position_size = new_size
         self.entry_price = new_avg
         self.additional_adds_done += 1
@@ -797,29 +778,19 @@ class Trader:
         stop_pct = self._stop_pct_for(self.entry_band)
         if self.stop_to_new_avg_after_add:
             self.emergency_stop_price = new_avg
-        elif is_long:
-            self.emergency_stop_price = new_avg * (1 - stop_pct)
         else:
-            self.emergency_stop_price = new_avg * (1 + stop_pct)
-        self._replace_stop(is_long, new_size, self.emergency_stop_price)
+            self.emergency_stop_price = new_avg * (1 - stop_pct)
+        self._replace_stop(new_size, self.emergency_stop_price)
         self._place_tp_for_position()
         self._tp2_placed_date = None
         self._clear_pending_add()
 
-    def _infer_band(self, direction, price, ema9, ema21, ema50):
-        if direction == LONG:
-            if ema9 is not None and price >= ema9:
-                return "EMA9"
-            if ema21 is not None and price >= ema21:
-                return "EMA21"
-            if ema50 is not None and price >= ema50:
-                return "EMA50"
+    def _infer_band(self, price, ema9, ema21, ema50):
+        if ema9 is not None and price >= ema9:
             return "EMA9"
-        if ema9 is not None and price <= ema9:
-            return "EMA9"
-        if ema21 is not None and price <= ema21:
+        if ema21 is not None and price >= ema21:
             return "EMA21"
-        if ema50 is not None and price <= ema50:
+        if ema50 is not None and price >= ema50:
             return "EMA50"
         return "EMA9"
 
@@ -827,23 +798,21 @@ class Trader:
         if self.pending_entry_oid:
             return False
         pos = self.get_position()
-        if pos["size"] == 0 or self.position_type is not None:
+        if pos["size"] <= 0 or self.position_type is not None:       # long-only: a short is never adopted
             return False
-        direction = LONG if pos["size"] > 0 else SHORT
-        is_long = direction == LONG
-        self.position_type = direction
-        self.position_size = abs(pos["size"])
+        self.position_type = LONG
+        self.position_size = pos["size"]
         self.entry_price = pos["entry"]
         self._partial_stop_size = 0.0
-        self.entry_band = self._infer_band(direction, self.entry_price, ema9, ema21, ema50)
+        self.entry_band = self._infer_band(self.entry_price, ema9, ema21, ema50)
         self.additional_adds_done = 0
         notional = abs(self.entry_price * self.position_size)
         prof_frac = (pos.get("pnl", 0.0) / notional) if notional > 0 else 0.0
         self.partial_tp_done = bool(self.TP_PROFIT_PCT and self.TP_PROFIT_PCT > 0 and prof_frac >= self.TP_PROFIT_PCT)
-        self.initial_entry_snapshot = self._initial_for(direction)
+        self.initial_entry_snapshot = self.initial_entry_long
         self.last_add_fill_date = None
         stop_pct = self.STOP_TIERS[-1][0]
-        self.emergency_stop_price = self.entry_price * (1 - stop_pct) if is_long else self.entry_price * (1 + stop_pct)
+        self.emergency_stop_price = self.entry_price * (1 - stop_pct)
 
         tos = self.get_trigger_orders()
 
@@ -851,17 +820,16 @@ class Trader:
             t = float(trig or 0)
             if t <= 0 or self.entry_price <= 0:
                 return False
-            correct_side = (t < self.entry_price) if is_long else (t > self.entry_price)
-            return correct_side and abs(t - self.entry_price) / self.entry_price <= 0.20
+            return t < self.entry_price and abs(t - self.entry_price) / self.entry_price <= 0.20
 
         if len(tos) == 0:
-            self._ensure_stop_loss_placed(is_long, self.position_size, self.emergency_stop_price)
+            self._ensure_stop_loss_placed(self.position_size, self.emergency_stop_price)
         elif len(tos) == 1 and stop_is_valid(tos[0].trigger_px):
             self.stop_loss_oid = tos[0].oid
             self.emergency_stop_price = float(tos[0].trigger_px)
         else:
             self.cancel_all_trigger_orders()
-            self._ensure_stop_loss_placed(is_long, self.position_size, self.emergency_stop_price)
+            self._ensure_stop_loss_placed(self.position_size, self.emergency_stop_price)
         if self.pending_entry_oid:
             self._cancel_entry_limit()
         if not self.partial_tp_done:
@@ -869,15 +837,10 @@ class Trader:
         return True
 
     # ═══════════════════════ gates ═══════════════════════
-    def _entry_band_for(self, direction):
-        return self.entry_band_label_short if direction == SHORT else self.entry_band_label
-
     def _raw_setup(self, ema9, ema21, ema50, band_label=None):
-        d, band, price = rules.raw_setup(ema9, ema21, ema50, self.ENABLE_SHORTS,
-                                         lambda dr: band_label or self._entry_band_for(dr))
-        return d, band, price
+        return rules.raw_setup(ema9, ema21, ema50, band_label or self.entry_band_label)
 
-    def _daily_ribbon_confirms(self, direction):
+    def _daily_ribbon_confirms(self):
         if not self.daily_ribbon_confirm:
             return True
         today = self._today()
@@ -888,17 +851,15 @@ class Trader:
                                         self.calculate_ema(closes, self.EMA_MID),
                                         self.calculate_ema(closes, self.EMA_SLOW))
             self._daily_ribbon_cache_date = today
-        return rules.daily_ribbon_confirms(direction, *self._daily_ribbon_cache)
+        return rules.daily_ribbon_confirms(*self._daily_ribbon_cache)
 
     def _select_setup(self, ema9, ema21, ema50, band_label=None):
         direction, band, price = self._raw_setup(ema9, ema21, ema50, band_label)
         if band is None:
             return None, None, None
-        if self.regime_allowed is not None and direction != self.regime_allowed:
+        if self.regime_blocks_longs:
             return None, None, None
-        if self.rs_direction is not None and direction != self.rs_direction:
-            return None, None, None
-        if not self._daily_ribbon_confirms(direction):
+        if not self._daily_ribbon_confirms():
             return None, None, None
         return direction, band, price
 
@@ -911,31 +872,31 @@ class Trader:
             closes_all_done = [float(c["c"]) for c in candles[:-1]]
             done = closes_all_done[-self.near_high_lookback:]
             self._lower_high_cache = rules.lower_high_stats(closes_all_done, self.lh_recent, self.lh_prior) or ()
-            self._near_extreme_cache = ((done[-1], max(done), min(done), len(done)) if len(done) >= 2 else ())
+            self._near_extreme_cache = ((done[-1], max(done), len(done)) if len(done) >= 2 else ())
             self._near_extreme_cache_date = today
         return self._near_extreme_cache
 
-    def _near_extreme_check(self, direction):
+    def _near_extreme_check(self):
         if self.near_high_max_pct <= 0:
             return True, ""
         data = self._near_extreme_data()
         if not data:
             return True, ""
-        last, hi, lo, n = data
-        dist = rules.near_extreme_dist(direction, last, hi, lo)
-        return dist <= self.near_high_max_pct, f"{dist * 100:.1f}% from the {n}d closing extreme"
+        last, hi, n = data
+        dist = rules.near_extreme_dist(last, hi)
+        return dist <= self.near_high_max_pct, f"{dist * 100:.1f}% below the {n}d closing high"
 
-    def _limit_extension_check(self, direction, limit_price):
+    def _limit_extension_check(self, limit_price):
         if self.limit_extension_max_pct <= 0 or not limit_price or limit_price <= 0:
             return True, ""
         data = self._near_extreme_data()
         if not data:
             return True, ""
-        _last, hi, lo, n = data
-        ext = rules.limit_extension_pct(direction, hi, lo, limit_price)
-        return ext <= self.limit_extension_max_pct, f"{n}d closing extreme is {ext * 100:.1f}% beyond the limit"
+        _last, hi, n = data
+        ext = rules.limit_extension_pct(hi, limit_price)
+        return ext <= self.limit_extension_max_pct, f"{n}d closing high is {ext * 100:.1f}% above the limit"
 
-    def _lower_high_check(self, direction):
+    def _lower_high_check(self):
         if not self.lower_high_filter:
             return True, ""
         if self._near_extreme_data() is None:
@@ -943,9 +904,17 @@ class Trader:
         stats = self._lower_high_cache
         if not stats:
             return True, ""
-        if not rules.lower_high_fails(direction, stats):
+        if not rules.lower_high_fails(stats):
             return True, ""
-        return False, "lower high" if direction == LONG else "higher low"
+        return False, "lower high"
+
+    def _entry_gates_pass(self, limit_price):
+        for check in (self._near_extreme_check, lambda: self._limit_extension_check(limit_price),
+                      self._lower_high_check):
+            ok, detail = check()
+            if not ok:
+                return False, detail
+        return True, ""
 
     def flat_reason(self, ema9, ema21, ema50, prev_close, live_price, closed_ribbon, drawdown_paused):
         """Why no entry limit is resting while flat (read-only, but it warms the daily caches exactly as the
@@ -961,22 +930,17 @@ class Trader:
             d, b, _p = self._raw_setup(ema9, ema21, ema50)
             if b is None:
                 return "ribbon not stacked (live EMA9 >= EMA21 >= EMA50 needed)"
-            if self.regime_allowed is not None and d != self.regime_allowed:
-                return f"regime blocks {d}"
-            if self.rs_direction is not None and d != self.rs_direction:
-                return f"relative strength allows {self.rs_direction} only"
-            return f"daily ribbon does not confirm {d}"
-        if not rules.closed_candle_confirms(direction, prev_close, *closed_ribbon, band):
-            return f"last closed candle {prev_close:.2f} is not beyond the {band}+ ribbon ({direction})"
-        for check in (lambda: self._near_extreme_check(direction),
-                      lambda: self._limit_extension_check(direction, limit_price),
-                      lambda: self._lower_high_check(direction)):
-            ok, detail = check()
-            if not ok:
-                return detail
-        if rules.would_fill_immediately(direction, limit_price, live_price):
+            if self.regime_blocks_longs:
+                return "regime blocks longs"
+            return "daily ribbon does not confirm"
+        if not rules.closed_candle_confirms(prev_close, *closed_ribbon, band):
+            return f"last closed candle {prev_close:.2f} is not above the {band}+ ribbon"
+        ok, detail = self._entry_gates_pass(limit_price)
+        if not ok:
+            return detail
+        if rules.would_fill_immediately(limit_price, live_price):
             return f"price {live_price:.2f} already past limit {limit_price:.2f} (would fill at market)"
-        return f"all gates pass - {direction} limit {band}@{limit_price:.2f} placing"
+        return f"all gates pass - limit {band}@{limit_price:.2f} placing"
 
     # ═══════════════════════ maintenance ═══════════════════════
     def _protect_partial_entry(self):
@@ -991,10 +955,8 @@ class Trader:
             return
         if self._partial_stop_size > 0 and abs(size - self._partial_stop_size) <= self._partial_stop_size * 0.01:
             return
-        is_long = (self.pending_entry_side or LONG) == LONG
         pct = self.STOP_TIERS[-1][0]
-        trig = entry * (1 - pct) if is_long else entry * (1 + pct)
-        if self._replace_stop(is_long, size, trig):
+        if self._replace_stop(size, entry * (1 - pct)):
             self._partial_stop_size = size
 
     def _maintain_entry_limit(self, ema9, ema21, ema50, prev_close, live_price, completed_ts,
@@ -1009,28 +971,25 @@ class Trader:
             if self.pending_entry_oid:
                 self._cancel_entry_limit()
             return
-        if not rules.closed_candle_confirms(direction, prev_close, *closed_ribbon, band):
+        if not rules.closed_candle_confirms(prev_close, *closed_ribbon, band):
             if self.pending_entry_oid:
                 self._cancel_entry_limit()
             return
-        for check in (lambda: self._near_extreme_check(direction),
-                      lambda: self._limit_extension_check(direction, limit_price),
-                      lambda: self._lower_high_check(direction)):
-            ok, _detail = check()
-            if not ok:
-                if self.pending_entry_oid:
-                    self._cancel_entry_limit()
-                return
-        if rules.would_fill_immediately(direction, limit_price, live_price):
+        ok, _detail = self._entry_gates_pass(limit_price)
+        if not ok:
             if self.pending_entry_oid:
                 self._cancel_entry_limit()
             return
-        same_setup = self.pending_entry_oid and self.pending_entry_side == direction and self.pending_entry_band == band
+        if rules.would_fill_immediately(limit_price, live_price):
+            if self.pending_entry_oid:
+                self._cancel_entry_limit()
+            return
+        same_setup = self.pending_entry_oid and self.pending_entry_band == band
         need_replace = (not self.pending_entry_oid or not same_setup
                         or (self._now() - self.last_limit_refresh_ts) >= self.LIMIT_REFRESH_SEC)
         if not need_replace:
             return
-        target = self._initial_for(direction)
+        target = self.initial_entry_long
         add = target
         if self.pending_entry_oid and same_setup:
             already = abs(self.get_position().get("size", 0))
@@ -1039,7 +998,7 @@ class Trader:
             self._cancel_entry_limit()
         if add <= 0:
             return
-        oid = self._place_entry_limit(direction, limit_price, add, completed_ts, band)
+        oid = self._place_entry_limit(limit_price, add, completed_ts, band)
         if oid:
             self.last_limit_refresh_ts = self._now()
 
@@ -1069,27 +1028,24 @@ class Trader:
             ema9, ema21, ema50, e9d, e21d, e50d, p_prev = e
             prev_close = p_prev
             closed_ribbon = (e9d, e21d, e50d)
-        add_band = self.pyramid_band_label_short if self.position_type == SHORT else self.pyramid_band_label
+        add_band = self.pyramid_band_label
         direction, band, limit_price = self._select_setup(ema9, ema21, ema50, band_label=add_band)
-        if band is None or direction != self.position_type:
+        if band is None:
             if self.pending_add_oid:
                 self._cancel_additional_limit()
             return
-        if not rules.closed_candle_confirms(direction, prev_close, *closed_ribbon, add_band):
+        if not rules.closed_candle_confirms(prev_close, *closed_ribbon, add_band):
             if self.pending_add_oid:
                 self._cancel_additional_limit()
             return
         pos = self.get_position()
         entry = pos.get("entry", 0) or self.entry_price
-        if entry and entry > 0 and live_price > 0:
-            prof_pct = (live_price - entry) / entry if self.position_type == LONG else (entry - live_price) / entry
-        else:
-            prof_pct = -1.0
+        prof_pct = (live_price - entry) / entry if (entry and entry > 0 and live_price > 0) else -1.0
         if prof_pct < self.PYRAMID_MIN_PROFIT_PCT:
             if self.pending_add_oid:
                 self._cancel_additional_limit()
             return
-        if rules.would_fill_immediately(direction, limit_price, live_price):
+        if rules.would_fill_immediately(limit_price, live_price):
             if self.pending_add_oid:
                 self._cancel_additional_limit()
             return
@@ -1100,7 +1056,7 @@ class Trader:
             return
         if self.pending_add_oid:
             self._cancel_additional_limit()
-        oid = self._place_additional_limit(direction, limit_price, add_usd, band)
+        oid = self._place_additional_limit(limit_price, add_usd, band)
         if oid:
             self.last_add_refresh_ts = self._now()
 
@@ -1118,9 +1074,8 @@ class Trader:
     def _check_exit(self, c_close, ema9, ema21, ema50, closes_done=None):
         if not self.position_type:
             return False
-        reason = rules.check_exit(self.position_type == LONG, closes_done or [], ema9, ema21, ema50,
-                                  self.exit_mode, self.exit_profit_2closes, self.exit_lower_close_max_closes,
-                                  self.EMA_FAST, self.EMA_MID, self.EMA_SLOW)
+        reason = rules.check_exit(closes_done or [], ema9, ema21, ema50, self.exit_mode, self.exit_profit_2closes,
+                                  self.exit_lower_close_max_closes, self.EMA_FAST, self.EMA_MID, self.EMA_SLOW)
         if reason:
             self._market_close_position(reason=reason, current_price=c_close)
             return True

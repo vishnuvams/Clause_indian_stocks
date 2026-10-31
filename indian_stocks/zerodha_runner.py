@@ -24,7 +24,7 @@ from .config import StrategyConfig
 from .data import ist_now
 from .frames import Frame
 from .kite_broker import KiteBroker, KiteUnsupported
-from .selection import Candidate, build_watchlist, regime_allowed
+from .selection import Candidate, build_watchlist, longs_allowed
 from .trader import OrderView, Trader, Venue
 
 CONFIRM_ENV, CONFIRM_VALUE = "ZERODHA_CONFIRM_LIVE", "I_UNDERSTAND"
@@ -53,16 +53,14 @@ class DryRunBroker:
         return self.real.orders() + list(self.virtual.values())
 
     def place_limit(self, is_buy, size, price, reduce_only=False):
-        kind = "TAKE-PROFIT" if reduce_only else ("BUY limit" if is_buy else "SELL limit")
+        kind = "TAKE-PROFIT" if reduce_only else "BUY limit"
         self.log(f"[dry-run] {self.real.symbol}: would place {kind} {int(size)} @ {price:.2f}")
-        if not is_buy and not reduce_only:
-            raise KiteUnsupported("opening a short is not possible in delivery")
         return "resting", self._new(OrderView(0, is_buy, size, price, reduce_only))
 
-    def place_stop(self, is_buy, size, trigger_px, limit_px):
+    def place_stop(self, size, trigger_px, limit_px):
         self.log(f"[dry-run] {self.real.symbol}: would place STOP (GTT) {int(size)} trigger {trigger_px:.2f} "
                  f"limit {limit_px:.2f}")
-        return "resting", self._new(OrderView(0, is_buy, size, limit_px, True, True, trigger_px))
+        return "resting", self._new(OrderView(0, False, size, limit_px, True, True, trigger_px))
 
     def cancel(self, oid):
         if oid in self.virtual:
@@ -70,7 +68,7 @@ class DryRunBroker:
         else:
             self.log(f"[dry-run] {self.real.symbol}: would cancel order {oid}")
 
-    def market_close(self, is_long, size, ref_price):
+    def market_close(self, size, ref_price):
         self.log(f"[dry-run] {self.real.symbol}: would SELL {int(size)} (IOC limit {ref_price:.2f}) to close")
         return True
 
@@ -89,7 +87,7 @@ class ZerodhaRunner:
         self.blacklist = list(blacklist)
         self.traders: Dict[str, Trader] = {}
         self._last_refresh: Optional[datetime] = None
-        self.regime: Optional[str] = None
+        self.longs_ok: Optional[bool] = None          # benchmark regime (None = filter off)
         self.watchlist: List[str] = []
 
     # ---- plumbing ----
@@ -117,7 +115,7 @@ class ZerodhaRunner:
     def refresh_watchlist(self):
         B = self._benchmark_frame()
         kb_i = (len(B) - 1) if B is not None else -1
-        self.regime = regime_allowed(B, kb_i, self.cfg, self.regime)
+        self.longs_ok = longs_allowed(B, kb_i, self.cfg, self.longs_ok)
         cands = []
         for sym in self.symbols:
             try:
@@ -139,7 +137,7 @@ class ZerodhaRunner:
                     self.log(f"{s.symbol}: you already hold it - skipped (adopt_existing=False)")
                     continue
                 tr = self.traders[s.symbol] = self._new_trader(s.symbol)
-            tr.in_scanner, tr._volume_blocked, tr.rs_direction = True, False, s.direction
+            tr.in_scanner, tr._volume_blocked = True, False
         self._last_refresh = self.now()
 
     # ---- one pass over every trader (EMAPullbackBot.check_all) ----
@@ -148,7 +146,7 @@ class ZerodhaRunner:
             self.refresh_watchlist()
         for sym in list(self.traders):
             tr = self.traders[sym]
-            tr.regime_allowed = self.regime if self.cfg.regime_filter_enabled else None
+            tr.regime_blocks_longs = self.cfg.regime_filter_enabled and self.longs_ok is False
             if tr._volume_blocked and tr.position_type is None and not tr.pending_entry_oid:
                 continue
             try:

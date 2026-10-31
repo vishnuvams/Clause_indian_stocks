@@ -29,7 +29,6 @@ class StrategyConfig:
     ema_slow: int = 50
 
     # ── Direction ───────────────────────────────────────────────────────────
-    enable_shorts: bool = False       # ENABLE_SHORTS (shorting delivery stock is not possible on NSE cash)
     regime_filter_enabled: bool = False
     regime_ema_period: int = 21       # REGIME_EMA_PERIOD
     regime_buffer_pct: float = 0.0    # REGIME_BUFFER_PCT
@@ -40,10 +39,8 @@ class StrategyConfig:
     adr_min_pct: float = 4.0          # ADR_MIN_PCT
     rs_enabled: bool = True           # RS_ENABLED
     rs_lookback_days: int = 30        # RS_LOOKBACK_DAYS
-    rs_min_pct_long: float = 10.0     # stocks: LONG must beat the benchmark by >= this many points
-    rs_min_pct_short: float = 10.0
+    rs_min_pct_long: float = 10.0     # stocks: must beat the benchmark by >= this many points
     rs_top_n_long: int = 0            # 0 = no cap
-    rs_top_n_short: int = 0
     recent_rs_filter: bool = True     # A
     recent_rs_days: int = 10          # RECENT_RS_DAYS
     recent_rs_min_pct: float = 0.0    # RECENT_RS_MIN_PCT
@@ -61,15 +58,12 @@ class StrategyConfig:
 
     # ── Entry ───────────────────────────────────────────────────────────────
     entry_ema: str = "ema9"           # LONG limit sits here
-    entry_ema_short: str = "ema21"
     limit_refresh_hours: float = 1.0  # LIMIT_REFRESH_HOURS
     initial_entry_inr_long: float = 10_000 * USD_INR   # initial_entry_usd_long  = 10000
-    initial_entry_inr_short: float = 2_500 * USD_INR   # initial_entry_usd_short = 2500
     leverage: float = 1.0
 
     # ── Scale-in (pyramid) ──────────────────────────────────────────────────
     pyramid_ema: str = "ema9"
-    pyramid_ema_short: str = "ema21"
     additional_entry_size_pct: float = 0.5
     additional_entry_size_step_pct: float = 0.10   # 50%, 40%, 30%, 20%, 10%, 10% ...
     additional_entry_size_min_pct: float = 0.10

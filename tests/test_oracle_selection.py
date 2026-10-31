@@ -1,5 +1,8 @@
-"""Differential test of the whole selection pipeline: ORIGINAL `EMAPullbackBot._refresh_stocks` vs
-`selection.build_watchlist` - same candles, same config -> the same ORDERED watchlist with the same RS sides."""
+"""Differential test of the whole selection pipeline: ORIGINAL `EMAPullbackBot._refresh_stocks` (shorts off, RS on)
+vs `selection.build_watchlist` - same candles, same config -> the same ORDERED watchlist.
+
+RS-off mode is not compared: there the original infers a long or short evaluation per stock from its EMAs, whereas
+the long-only port treats every stock as a long candidate."""
 import collections
 import contextlib
 import dataclasses
@@ -19,8 +22,7 @@ pytestmark = pytest.mark.skipif(not oracle.original_available(), reason="origina
 MAP = {
     "min_volume_usd": "min_turnover_inr", "adr_min_pct": "adr_min_pct", "adr_period": "adr_period",
     "rs_enabled": "rs_enabled", "rs_lookback_days": "rs_lookback_days", "rs_min_pct_long": "rs_min_pct_long",
-    "rs_min_pct_short": "rs_min_pct_short", "rs_top_n_long": "rs_top_n_long", "rs_top_n_short": "rs_top_n_short",
-    "enable_shorts": "enable_shorts", "ema_fast": "ema_fast", "ema_mid": "ema_mid", "ema_slow": "ema_slow",
+    "rs_top_n_long": "rs_top_n_long", "ema_fast": "ema_fast", "ema_mid": "ema_mid", "ema_slow": "ema_slow",
     "near_high_max_pct": "near_high_max_pct", "near_high_lookback": "near_high_lookback",
     "recent_rs_filter": "recent_rs_filter", "recent_rs_days": "recent_rs_days",
     "recent_rs_min_pct": "recent_rs_min_pct", "ema21_rising_filter": "ema21_rising_filter",
@@ -76,6 +78,7 @@ def original_watchlist(mod, cfg, candles, vols):
     bot = object.__new__(mod.EMAPullbackBot)
     bot.info = FakeUniverseInfo(candles, vols)
     bot.dex_name, bot.is_stocks, bot.blacklist = "xyz", True, set()
+    bot.enable_shorts, bot.rs_min_pct_short, bot.rs_top_n_short = False, 10.0, 0      # the port is long-only
     bot.adr_fetch_sleep_sec, bot.rs_benchmark = 0, "SP500"
     bot._candle_api_params = ["req"]
     for attr, field in MAP.items():
@@ -116,10 +119,8 @@ def random_cfg(rng):
     return dataclasses.replace(
         StrategyConfig(),
         min_turnover_inr=FLOOR, adr_min_pct=rng.choice([0.0, 2.0, 4.0]),
-        rs_enabled=rng.random() > 0.15, rs_lookback_days=rng.choice([20, 30]),
-        rs_min_pct_long=rng.choice([-15.0, 0.0, 5.0, 10.0, 20.0]), rs_min_pct_short=rng.choice([5.0, 10.0]),
-        rs_top_n_long=rng.choice([0, 0, 2, 5]), rs_top_n_short=rng.choice([0, 0, 2, 3]),
-        enable_shorts=rng.random() > 0.5,
+        rs_enabled=True, rs_lookback_days=rng.choice([20, 30]),
+        rs_min_pct_long=rng.choice([-15.0, 0.0, 5.0, 10.0, 20.0]), rs_top_n_long=rng.choice([0, 0, 2, 5]),
         near_high_max_pct=rng.choice([0.0, 0.05, 0.10, 0.20]), recent_rs_filter=rng.random() > 0.3,
         recent_rs_days=rng.choice([5, 10]), recent_rs_min_pct=rng.choice([0.0, 2.0]),
         ema21_rising_filter=rng.random() > 0.3, ema21_slope_min_pct=rng.choice([0.5, 1.0]),
@@ -142,36 +143,8 @@ def test_watchlist_matches_original_stage_for_stage():
         sides.update(side for _s, side in want)
         for r in dropped.values():
             reasons[r.split(" ")[0] + " " + r.split(" ")[1] if " " in r else r] += 1
-    # the scenarios were not trivial: non-empty watchlists, both sides, and every stage dropped something
+    # the scenarios were not trivial: non-empty watchlists and every stage dropped something
     assert sum(1 for s in sizes if s) >= 30 and max(sizes) >= 3
-    assert sides["LONG"] > 0 and sides["SHORT"] > 0 and sides[None] > 0
+    assert sides["LONG"] > 0 and set(sides) == {"LONG"}                  # long-only: no SHORT, ever
     for needle in ("traded", "ADR", "no", "RS", "daily", "cut", "making"):
         assert any(k.startswith(needle) for k in reasons), f"no symbol was ever dropped by '{needle}' ({dict(reasons)})"
-
-
-def _stock_with_30d_return(ret, n=250, p=100.0):
-    """Flat history, then a straight line to `ret` over the last 30 completed days; in-progress candle = last close."""
-    closes = [p] * (n - 31) + [p * (1 + ret * k / 30.0) for k in range(31)] + [p * (1 + ret)]
-    cs = []
-    for i, c in enumerate(closes[:n]):
-        cs.append({"t": i * 86_400_000, "o": c, "h": c * 1.03, "l": c * 0.97, "c": c, "v": 1})
-    return cs
-
-
-def test_leader_laggard_overlap_resolves_to_leader_like_the_original():
-    """With rs_min_pct_long = -15 and rs_min_pct_short = 10 a stock at -12 pts is BOTH a leader and a laggard;
-    the original calls it a leader (laggards = laggards - leaders)."""
-    mod = oracle.load_original()
-    cfg = dataclasses.replace(StrategyConfig(), min_turnover_inr=FLOOR, adr_min_pct=0.0, rs_min_pct_long=-15.0,
-                              rs_min_pct_short=10.0, enable_shorts=True, near_high_max_pct=0.0,
-                              recent_rs_filter=False, ema21_rising_filter=False, lower_high_filter=False)
-    candles = {"xyz:SP500": _stock_with_30d_return(0.0), "xyz:A": _stock_with_30d_return(-0.12),
-               "xyz:B": _stock_with_30d_return(-0.30), "xyz:C": _stock_with_30d_return(0.05)}
-    vols = {"A": FLOOR * 2, "B": FLOOR * 2, "C": FLOOR * 2}
-    # the daily-ribbon stage would drop flat/declining shapes, so compare the RS stage itself
-    cfg = dataclasses.replace(cfg, ema_fast=1, ema_mid=2, ema_slow=3)
-    want = original_watchlist(mod, cfg, candles, vols)
-    got, _ = my_watchlist(cfg, candles, vols)
-    assert got == want
-    sides = dict(want)
-    assert sides.get("A") == "LONG"                      # the overlapping stock resolves to LONG, not SHORT

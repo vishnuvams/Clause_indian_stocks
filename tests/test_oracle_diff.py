@@ -1,4 +1,5 @@
-"""Differential tests: the ORIGINAL `EMAPullbackTrader` vs `indian_stocks.trader.Trader`.
+"""Differential tests: the ORIGINAL `EMAPullbackTrader` (run with shorts OFF) vs the long-only
+`indian_stocks.trader.Trader`.
 
 Both are driven through the same fake exchange with the same candle feed and the same intraday price path
 (4 polls per day).  After EVERY poll the resting orders (side, size, price, reduce-only, trigger), the position,
@@ -15,7 +16,6 @@ from tests import differential as D
 pytestmark = pytest.mark.skipif(not oracle.original_available(), reason="original bot not found (set EMA_BOT_PATH)")
 
 UP = ((0.007, 0.022), (-0.004, 0.02))
-DOWN = ((-0.007, 0.022), (0.004, 0.02))
 CHOP = ((0.0, 0.03),)
 
 
@@ -62,14 +62,6 @@ def test_tiered_stops(mod):
            regimes=((0.006, 0.03), (-0.004, 0.03)))
 
 
-def test_shorts_mirror(mod):
-    t = family(mod, range(12), need=("position_opened",), over={"enable_shorts": True}, rs="SHORT", regimes=DOWN)
-    assert t["exit_by_market_close"] + t["closed_by_stop_or_tp"] > 0
-
-
-def test_both_directions_when_rs_gate_is_off(mod):
-    family(mod, range(12), need=("position_opened",), over={"enable_shorts": True}, rs=None,
-           regimes=((0.008, 0.022), (-0.008, 0.022)), switch=45)
 
 
 def test_stop_to_new_average_after_add(mod):
@@ -112,10 +104,11 @@ def test_long_refresh_interval_keeps_resting_limits(mod):
 
 
 def test_regime_gate_toggles(mod):
+    """Benchmark below/above its EMA21, switching every 15 days: the original's regime_allowed LONG/None vs SHORT
+    (which blocks longs) and the port's boolean."""
     def hook(day, pair):
-        pair.set_all(regime_allowed=[ "LONG", None, "SHORT", "LONG"][(day // 15) % 4])
-    family(mod, range(10), need=("position_opened",), hook=hook, over={"enable_shorts": True}, rs=None,
-           regimes=((0.008, 0.022), (-0.008, 0.022)), switch=40)
+        pair.set_regime(blocks_longs=(day // 15) % 3 == 2)
+    t = family(mod, range(10), need=("position_opened",), hook=hook)
 
 
 def test_watchlist_membership_and_drawdown_pause(mod):
@@ -227,9 +220,3 @@ def test_4h_pyramid_timeframe_adds(mod):
             **SLOW_EXIT}
     intraday_family(mod, range(5), need=("position_opened", "add_filled"), over=over, regimes=STRONG, days=45)
 
-
-def test_1h_shorts_mirror(mod):
-    over = {"signal_interval": "1h", "enable_shorts": True, "pyramid_min_profit_pct": 0.03, "tp_profit_pct": 0.06,
-            **SLOW_EXIT}
-    intraday_family(mod, range(4), need=("position_opened",), over=over, rs="SHORT",
-                    regimes=((-0.02, 0.025), (0.01, 0.03)), days=40)

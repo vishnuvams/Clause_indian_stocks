@@ -82,10 +82,9 @@ def test_weak_run_decision_parity(orig):
     for _ in range(4000):
         closes = rnd_closes(rng, rng.randint(5, 80))
         period = rng.choice([3, 9, 21, 50])
-        is_long = rng.random() < 0.5
         mx = rng.choice([2, 3, 4])
-        a = ns["_weak_run_decision"](closes, period, is_long, mx)
-        b = rules.weak_run_decision(closes, period, is_long, mx)
+        a = ns["_weak_run_decision"](closes, period, True, mx)          # the original, LONG side
+        b = rules.weak_run_decision(closes, period, mx)
         assert a == b
         hits[a[2]] += 1
     assert hits["lower_close"] > 50 and hits["time_limit"] > 5       # the test actually exercised both branches
@@ -97,36 +96,32 @@ def test_small_helpers_parity(orig):
     for _ in range(500):
         closes = rnd_closes(rng, rng.randint(1, 40))
         r, p = rng.randint(2, 8), rng.randint(2, 8)
-        assert ns["_lower_high_stats"](closes, r, p) == rules.lower_high_stats(closes, r, p)
-        st = rules.lower_high_stats(closes, r, p)
-        if st:
-            for d in ("LONG", "SHORT"):
-                assert ns["_lower_high_fails"](d, st) == rules.lower_high_fails(d, st)
+        orig_stats = ns["_lower_high_stats"](closes, r, p)               # (recent_high, prior_high, recent_low, prior_low)
+        mine = rules.lower_high_stats(closes, r, p)
+        assert (orig_stats is None) == (mine is None)
+        if mine:
+            assert orig_stats[:2] == mine
+            assert ns["_lower_high_fails"]("LONG", orig_stats) == rules.lower_high_fails(mine)
         hi, lo, last, lim = max(closes), min(closes), closes[-1], closes[-1] * rng.uniform(0.7, 1.3)
-        for d in ("LONG", "SHORT"):
-            assert ns["_limit_extension_pct"](d, hi, lo, lim) == rules.limit_extension_pct(d, hi, lo, lim)
-            assert ns["_near_extreme_dist"](d, last, hi, lo) == rules.near_extreme_dist(d, last, hi, lo)
+        assert ns["_limit_extension_pct"]("LONG", hi, lo, lim) == rules.limit_extension_pct(hi, lim)
+        assert ns["_near_extreme_dist"]("LONG", last, hi, lo) == rules.near_extreme_dist(last, hi)
 
 
 def test_closed_candle_and_raw_setup_parity(orig):
     _, Stub = orig
     rng = random.Random(5)
-    for enable_shorts in (False, True):
-        t = Stub()
-        t.ENABLE_SHORTS = enable_shorts
-        t.entry_band_label, t.entry_band_label_short = "EMA9", "EMA21"
-        t._entry_band_for = lambda d, t=t: t.entry_band_label_short if d == "SHORT" else t.entry_band_label
-        for _ in range(3000):
-            e = [rng.choice([None, rng.uniform(90, 110)]) if rng.random() < 0.05 else rng.uniform(90, 110) for _ in range(3)]
-            e9, e21, e50 = e
-            a = t._raw_setup(e9, e21, e50, 100.0)
-            b = rules.raw_setup(e9, e21, e50, enable_shorts, lambda d: "EMA21" if d == "SHORT" else "EMA9")
-            assert a == b
-            close = rng.uniform(90, 110)
-            for d in ("LONG", "SHORT"):
-                for band in ("EMA9", "EMA21", "EMA50"):
-                    assert t._closed_candle_confirms(d, close, e9, e21, e50, band_label=band) == \
-                        rules.closed_candle_confirms(d, close, e9, e21, e50, band)
+    t = Stub()
+    t.ENABLE_SHORTS = False
+    t.entry_band_label, t.entry_band_label_short = "EMA9", "EMA21"
+    t._entry_band_for = lambda d, t=t: t.entry_band_label
+    for _ in range(3000):
+        e = [rng.choice([None, rng.uniform(90, 110)]) if rng.random() < 0.05 else rng.uniform(90, 110) for _ in range(3)]
+        e9, e21, e50 = e
+        assert t._raw_setup(e9, e21, e50, 100.0) == rules.raw_setup(e9, e21, e50, "EMA9")
+        close = rng.uniform(90, 110)
+        for band in ("EMA9", "EMA21", "EMA50"):
+            assert t._closed_candle_confirms("LONG", close, e9, e21, e50, band_label=band) == \
+                rules.closed_candle_confirms(close, e9, e21, e50, band)
 
 
 def test_daily_ribbon_parity(orig):
@@ -139,8 +134,7 @@ def test_daily_ribbon_parity(orig):
     for _ in range(2000):
         trip = tuple(None if rng.random() < 0.1 else rng.uniform(90, 110) for _ in range(3))
         t._daily_ribbon_cache = trip
-        for d in ("LONG", "SHORT"):
-            assert t._daily_ribbon_confirms(d) == rules.daily_ribbon_confirms(d, *trip)
+        assert t._daily_ribbon_confirms("LONG") == rules.daily_ribbon_confirms(*trip)
 
 
 @pytest.mark.parametrize("mode", ["ema9_ema21", "ema9_ema50", "ema9_ema21_ema50"])
@@ -156,18 +150,17 @@ def test_check_exit_parity(orig, mode, ref):
                   [1.0] * len(closes))
         k = len(closes) - 1
         e9, e21, e50 = F.triple_done(k)
-        for is_long in (True, False):
-            t = Stub()
-            t.position_type = "LONG" if is_long else "SHORT"
-            t.entry_price = closes[-1] * rng.uniform(0.9, 1.1)
-            t.EMA_SLOW, t.EMA_MID, t.EMA_FAST = 50, 21, 9
-            t.exit_profit_2closes, t.exit_lower_close_max_closes, t.exit_mode = ref, 3, mode
-            t.symbol = "X"
-            t._display_price = lambda p: f"{p:.2f}"
-            closed = []
-            t._market_close_position = lambda reason, current_price, closed=closed: closed.append(reason)
-            got = t._check_exit(closes[-1], e9, e21, e50, closes_done=closes)
-            mine = rules.check_exit(is_long, closes, e9, e21, e50, mode, ref, 3)
-            assert got == (mine is not None), (mode, ref, is_long)
-            fired += got
+        t = Stub()
+        t.position_type = "LONG"
+        t.entry_price = closes[-1] * rng.uniform(0.9, 1.1)
+        t.EMA_SLOW, t.EMA_MID, t.EMA_FAST = 50, 21, 9
+        t.exit_profit_2closes, t.exit_lower_close_max_closes, t.exit_mode = ref, 3, mode
+        t.symbol = "X"
+        t._display_price = lambda p: f"{p:.2f}"
+        closed = []
+        t._market_close_position = lambda reason, current_price, closed=closed: closed.append(reason)
+        got = t._check_exit(closes[-1], e9, e21, e50, closes_done=closes)
+        mine = rules.check_exit(closes, e9, e21, e50, mode, ref, 3)
+        assert got == (mine is not None), (mode, ref)
+        fired += got
     assert fired > 20

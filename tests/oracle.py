@@ -295,6 +295,7 @@ def make_original_trader(mod, hl: FakeHL, kwargs: Optional[dict] = None, *, rs_d
     kw = stocks_trader_kwargs(mod)
     if kwargs:
         kw.update(kwargs)
+    assert not kw.get("enable_shorts"), "the port is long-only: the oracle must run the original with shorts off"
     initial_long = kw.pop("initial_entry_usd_long", initial_long)
     initial_short = kw.pop("initial_entry_usd_short", initial_short)
     tr = mod.EMAPullbackTrader(

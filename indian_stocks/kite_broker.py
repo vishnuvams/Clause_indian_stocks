@@ -15,7 +15,6 @@ How the original bot's Hyperliquid order model is mapped onto Kite
                                                 LIMIT sell at `limit_px` (the original also uses trigger*0.95)
  reduce-only TP limit (TP1 / TP2)               GTT (single) SELL at the TP price (triggers when LTP rises to it)
  market_close                                   LIMIT SELL, validity IOC, at the 3%-through price the original uses
- shorts                                         NOT SUPPORTED (delivery shorting does not exist) -> raises
 
 GTT ids are exposed as `GTT_OFFSET + id` so they cannot collide with order ids and still sort "newer = larger".
 A GTT is classified as a stop (vs a take-profit) from where its trigger sits relative to the LTP it was created
@@ -43,7 +42,7 @@ _DONE = {"COMPLETE", "CANCELLED", "REJECTED"}
 
 
 class KiteUnsupported(RuntimeError):
-    """Something the original strategy does that Zerodha cash delivery cannot."""
+    """A request Kite cannot serve (unknown interval or instrument)."""
 
 
 def _ms(dt: datetime) -> int:
@@ -252,11 +251,9 @@ class KiteBroker:
             if self.ltp() >= price:                                    # already through the target: a GTT could
                 return "resting", self._place("SELL", qty, "LIMIT", price)      # not trigger, so sell now
             return "resting", self._gtt(price, qty, price)
-        raise KiteUnsupported("opening a short (or buying to cover) is not possible in Zerodha delivery (CNC)")
+        raise ValueError("a long-only trader only buys to enter and sells (reduce-only) to take profit")
 
-    def place_stop(self, is_buy: bool, size: float, trigger_px: float, limit_px: float):
-        if is_buy:
-            raise KiteUnsupported("buy-side stops (for shorts) are not supported")
+    def place_stop(self, size: float, trigger_px: float, limit_px: float):
         qty = int(size)
         if qty < 1:
             return None
@@ -272,9 +269,7 @@ class KiteBroker:
         else:
             self.k.cancel_order(variety="regular", order_id=str(oid))
 
-    def market_close(self, is_long: bool, size: float, ref_price: float) -> bool:
-        if not is_long:
-            raise KiteUnsupported("closing a short is not supported")
+    def market_close(self, size: float, ref_price: float) -> bool:
         oid = self._place("SELL", int(size), "LIMIT", ref_price, validity="IOC")
         for _ in range(4):                                             # order status updates asynchronously
             for o in self.k.orders() or []:
