@@ -78,6 +78,16 @@ class Frame:
                    df["low"].astype(float).tolist(), df["close"].astype(float).tolist(),
                    df["turnover"].astype(float).tolist(), periods)
 
+    @classmethod
+    def from_candles(cls, cs: List[dict], periods=(9, 21, 50)) -> "tuple[Frame, float]":
+        """Frame of the COMPLETED candles of a broker candle list (whose last candle is still forming), plus the
+        live price (the forming candle's close).  Turnover is approximated as close x volume."""
+        done = cs[:-1]
+        n = len(done)
+        f = cls(list(range(n)), list(range(1, n + 1)), [c["o"] for c in done], [c["h"] for c in done],
+                [c["l"] for c in done], [c["c"] for c in done], [c["c"] * c.get("v", 0.0) for c in done], periods)
+        return f, float(cs[-1]["c"])
+
     # -- lookups --------------------------------------------------------
     def done_index(self, ts: int) -> int:
         """Index of the last bar fully closed at time `ts` (-1 if none)."""

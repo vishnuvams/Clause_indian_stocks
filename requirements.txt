@@ -3,3 +3,4 @@ numpy>=1.24
 requests>=2.28
 yfinance>=0.2.40
 pytest>=7.0
+kiteconnect>=5.0        # only for the Zerodha runner

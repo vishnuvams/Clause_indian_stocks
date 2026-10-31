@@ -11,7 +11,7 @@ python -m indian_stocks universe --universe nifty500     # candidate list (NSE i
 python -m indian_stocks fetch    --universe nifty500     # download + cache daily candles
 python -m indian_stocks scan     --universe nifty500     # today's watchlist + entry limits, stops, TP1
 
-python -m pytest                                         # 109 tests, no network needed
+python -m pytest                                         # 134 tests, no network needed
 ```
 
 Ported from
@@ -96,6 +96,41 @@ sized 50 → 40 → 30 → 20 → 10 % (floor) of the initial position, max 10; 
 `frames.py` computes EMAs over the full history; the original recomputes over its last 250 candles. They agree to
 within a rounding error once ~100 candles exist (and exactly when given the same input — see the parity tests).
 
+## Running on Zerodha (Kite Connect)
+
+```bash
+export KITE_API_KEY=...  KITE_ACCESS_TOKEN=...          # the token expires every morning (normal Kite login flow)
+python -m indian_stocks zerodha --universe nifty200 --once      # DRY RUN: reads your data, logs what it WOULD do
+python -m indian_stocks zerodha --universe nifty200             # DRY RUN loop (every 30 min, 09:15-15:30 IST)
+# live: add --live AND export ZERODHA_CONFIRM_LIVE=I_UNDERSTAND   (both are required)
+```
+
+`indian_stocks/kite_broker.py` implements the `Broker` interface for one stock; `zerodha_runner.py` builds the
+watchlist from Kite candles and runs one `Trader` per selected stock. **Dry run is the default**: it sends nothing.
+
+How Hyperliquid's order model maps onto Zerodha delivery (CNC) - this is where Zerodha forces differences:
+
+| Original (Hyperliquid) | Zerodha |
+|---|---|
+| GTC entry / add limit | regular **LIMIT BUY, validity DAY**. It lapses at 15:30; the trader re-places a missing entry/add limit on the next poll anyway |
+| reduce-only stop-market trigger | **GTT** (single) SELL: when LTP falls to the trigger Kite places a LIMIT sell at trigger x 0.95 (the original's own cap). Regular orders cannot rest overnight, GTT can |
+| reduce-only TP1 / TP2 limits | **GTT** SELL at the target price |
+| market close | LIMIT SELL, validity IOC, 3 % through the price (as the original); success is read back from the order book |
+| shorts | **not possible** (delivery). The adapter raises instead of translating them |
+
+Things to know before trusting it:
+* **A GTT stop is a stop-*limit*.** A gap down of more than 5 % through the trigger can leave the order unfilled, and an
+  unfilled stop does not retry. The original (a stop-*market* trigger) has the same 5 % cap, but check how you feel about it.
+* A stock you **already hold** is skipped (`--adopt-existing` overrides): the trader treats a whole holding as *its*
+  position, so it would put a stop on it and may sell it.
+* The position is read as holdings (settled + T+1) plus today's CNC buys from `positions()`. If your account shows
+  T+1 shares in both places the size will be doubled - look at the first dry-run output. 
+* Kite's historical API is limited to ~3 requests/s, so refreshing a 200-stock watchlist takes about a minute and a half.
+* **Not verified live.** Request shapes follow the installed `kiteconnect` SDK; response field names (orders, positions,
+  holdings, GTT) follow Kite's documentation from memory. The adapter, the runner and the full `Trader` flow are tested
+  against a fake Kite only (`tests/fake_kite.py`) - including DAY orders lapsing every afternoon. Your first run should be
+  the dry run, then a single small stock.
+
 ## Data
 
 | `--provider` | Source | Notes |
@@ -121,7 +156,7 @@ would be rested, with its limit, −10 % stop and TP1.
 
 ## Tests
 
-`python -m pytest` — 109 tests (~2 min; the oracle tests need the original file: set `EMA_BOT_PATH`, they skip if it is absent).
+`python -m pytest` — 134 tests (~2 min; the oracle tests need the original file: set `EMA_BOT_PATH`, they skip if it is absent).
 
 * **Parity with the original** (`tests/test_parity.py`): the original bot's `calculate_ema`, `_weak_run_decision`,
   `_raw_setup`, `_closed_candle_confirms`, `_daily_ribbon_confirms` and the whole `_check_exit` ladder are
@@ -169,8 +204,8 @@ are instantaneous at the limit/trigger price, with no fees or slippage, and only
 traders, adopting positions in symbols the bot has no trader for, universe refresh cadence and regime scheduling -
 the regime *function* is ported and tested), rate-limit back-off and sleeps, Telegram and trade logging, the
 daily-drawdown balance bookkeeping (the pause flag itself is supported; the original's default is **off**), and the
-status printing. There is **no NSE `Broker` implementation** - `Trader` needs an adapter for Zerodha / Upstox / Dhan
-that implements the 7-method `Broker` protocol.
+status printing. There is a **Zerodha** `Broker` (see "Running on Zerodha"); Upstox / Dhan would each need their own adapter
+implementing the 7-method `Broker` protocol.
 
 **Changed on purpose:** price/size rounding is a `Venue` (NSE: Rs 0.05 tick, whole shares; the oracle tests inject the
 original's Hyperliquid rounding so both sides are compared on equal terms); the 24-hour rolling volume becomes the last

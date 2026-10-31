@@ -165,6 +165,15 @@ def cmd_scan(a):
     print(f"\nfull table (incl. why each stock was dropped) -> {a.out}")
 
 
+def cmd_zerodha(a):
+    from .zerodha_runner import ZerodhaRunner, kite_from_env
+    cfg = make_cfg(a)
+    runner = ZerodhaRunner(kite_from_env(), cfg, pick_symbols(a), live=a.live, adopt_existing=a.adopt_existing,
+                           blacklist=a.blacklist, refresh_minutes=a.refresh_minutes)
+    print(("LIVE - orders WILL be sent to Zerodha" if a.live else "DRY RUN - nothing is sent to Zerodha"))
+    runner.cycle() if a.once else runner.run_forever(a.poll_minutes)
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="python -m indian_stocks",
                                  description="EMA 9/21/50 ribbon-pullback strategy on Indian (NSE) stocks")
@@ -185,6 +194,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--out", default="results/scan.csv")
     s.set_defaults(fn=cmd_scan)
 
+
+    z = sub.add_parser("zerodha", help="run the strategy on a Zerodha (Kite Connect) account - DRY RUN unless --live")
+    add_common(z)
+    add_strategy(z)
+    z.add_argument("--live", action="store_true", help=f"send real orders (also needs {'ZERODHA_CONFIRM_LIVE'}=I_UNDERSTAND)")
+    z.add_argument("--once", action="store_true", help="run a single cycle and exit")
+    z.add_argument("--adopt-existing", action="store_true", help="manage stocks you already hold (dangerous)")
+    z.add_argument("--poll-minutes", type=float, default=30)
+    z.add_argument("--refresh-minutes", type=float, default=120)
+    z.set_defaults(fn=cmd_zerodha)
     return ap
 
 
