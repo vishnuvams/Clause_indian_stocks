@@ -12,6 +12,7 @@ from . import rules
 from .config import StrategyConfig
 from .data import drop_incomplete_last_bar, get_provider, ist_now
 from .entry import evaluate_entry
+from . import position as posrules
 from .frames import Frame
 from .selection import regime_allowed, select_symbol
 from .universe import load_universe
@@ -142,10 +143,11 @@ def cmd_scan(a):
                 x=x, rs_dir=sel.direction, regime=regime,
                 eband=rules.band_label(c.entry_ema), eband_s=rules.band_label(c.entry_ema_short))
             if direction:
-                stop_pct = c.stop_tiers[-1][0]
-                sign = 1 if direction == rules.LONG else -1
-                row.update(entry_limit=round(limit, 2), stop=round(limit * (1 - sign * stop_pct), 2),
-                           tp1=round(limit * (1 + sign * c.tp_profit_pct), 2),
+                units = max(int((c.initial_entry_inr_short if direction == rules.SHORT else c.initial_entry_inr_long) / limit), 1)
+                stop = posrules.stop_levels(direction, limit, units, c)[-1][0]       # deepest tier
+                t1 = posrules.tp1(direction, limit, units, c)
+                row.update(entry_limit=round(limit, 2), stop=round(stop, 2),
+                           tp1=round(t1[0], 2) if t1 else None,
                            note=f"{direction} limit on {band}")
             else:
                 row["note"] = why

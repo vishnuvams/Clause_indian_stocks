@@ -11,7 +11,7 @@ python -m indian_stocks universe --universe nifty500     # candidate list (NSE i
 python -m indian_stocks fetch    --universe nifty500     # download + cache daily candles
 python -m indian_stocks scan     --universe nifty500     # today's watchlist + entry limits, stops, TP1
 
-python -m pytest                                         # 64 tests, no network needed
+python -m pytest                                         # 73 tests, no network needed
 ```
 
 Ported from
@@ -26,6 +26,7 @@ Ported from
 | `indian_stocks/config.py` | every parameter (`StrategyConfig`) | module constants + `VENUE_CFG["stocks"]` |
 | `indian_stocks/rules.py` | pure rule functions | `calculate_ema`, `_weak_run_decision`, `_check_exit`, `_raw_setup`, `_closed_candle_confirms`, `_daily_ribbon_confirms`, `_would_fill_immediately`, near-high / extension / lower-high helpers, `_add_size_pct` |
 | `indian_stocks/selection.py` | the watchlist filters + benchmark regime | `_refresh_stocks`, `_update_market_regime` |
+| `indian_stocks/position.py` | stop levels, TP1/TP2, breakeven, stop re-basing after an add, add gates and sizes | `_on_entry_limit_filled`, `_place_tp_for_position`, `_tp2_target`, `check_tp_filled`, `_on_additional_filled`, `_maintain_additional_limit` gates |
 | `indian_stocks/entry.py` | the entry gate stack | `_select_setup`, `_maintain_entry_limit` |
 | `indian_stocks/frames.py` | candle frame with EMA series ("done" vs "live" EMA) | `calculate_ema` on completed / in-progress candles |
 | `indian_stocks/universe.py` | NSE stock list (Nifty 50/100/200/500, all EQ), ETF/fund/REIT filtering | `_is_equity` |
@@ -119,7 +120,7 @@ would be rested, with its limit, −10 % stop and TP1.
 
 ## Tests
 
-`python -m pytest` — 64 tests.
+`python -m pytest` — 73 tests.
 
 * **Parity with the original** (`tests/test_parity.py`): the original bot's `calculate_ema`, `_weak_run_decision`,
   `_raw_setup`, `_closed_candle_confirms`, `_daily_ribbon_confirms` and the whole `_check_exit` ladder are
@@ -128,6 +129,25 @@ would be rested, with its limit, −10 % stop and TP1.
 * Rule examples, every selection gate, and every entry gate in isolation.
 * Data parsing (bhavcopy, Yahoo normalisation/caching with mocked downloads, session-bar resampling, incomplete
   last bar), universe filtering, and the CLI end-to-end on CSV files.
+
+## How closely this follows the original
+
+**Ported and checked against the original's own code** (`tests/test_parity.py` executes the original functions):
+EMA, the lower-close exit, the full exit ladder, the entry setup, the closed-candle confirmation, the daily-ribbon
+test, and the near-high / limit-extension / lower-high helpers.
+
+**Ported from reading the code, covered by unit tests but *not* executed against the original** (those parts are
+buried in methods that talk to the exchange): the selection pipeline (`selection.py`), the order of the entry gates
+(`entry.py`), and the stop / TP1 / TP2 / scale-in arithmetic (`position.py`).
+
+**Deliberately not ported** (operational, not strategy): order-id tracking and the exchange-side stop reconciliation
+(`_defensive_stop_check`, `_enforce_single_orders`, tier-stop re-placement), restart-sync / adopting existing positions,
+partial-fill top-up and protection of a half-filled entry, rate-limit back-off, Telegram and trade logging, and the
+daily-drawdown pause (its default in the original is **off**, `MAX_DAILY_DRAWDOWN_PCT = 0`).
+
+**Changed on purpose:** the 24-hour rolling volume becomes the last completed day's traded value; the bot's
+~30-minute polling (hourly limit refresh, intraday re-pricing of the EMA9 limit) is replaced by one evaluation —
+`scan` shows what would be rested at the next open.
 
 ## What is not here
 
