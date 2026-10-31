@@ -1,7 +1,18 @@
 # Clause_indian_stocks
 
-The **EMA 9/21/50 ribbon-pullback strategy** for **Indian (NSE) stocks** — the rules only: stock selection,
-entry, exit, stops, take-profits and scale-ins. No backtester, no data download, no broker code.
+The **EMA 9/21/50 ribbon-pullback strategy** for **Indian (NSE) stocks**: stock selection, entry, exit, stops,
+take-profits and scale-ins, plus the NSE stock list, data download and a daily scanner. **There is no backtester**
+(and no broker code).
+
+```bash
+pip install -r requirements.txt
+
+python -m indian_stocks universe --universe nifty500     # candidate list (NSE index CSV)
+python -m indian_stocks fetch    --universe nifty500     # download + cache daily candles
+python -m indian_stocks scan     --universe nifty500     # today's watchlist + entry limits, stops, TP1
+
+python -m pytest                                         # 64 tests, no network needed
+```
 
 Ported from
 [`ema_9_21_50_stocks_crypto_1day_1hour.py`](https://github.com/vishnuvams/clude_crypto/blob/claude/1h-ribbon-entry-exit/ema_9_21_50_stocks_crypto_1day_1hour.py)
@@ -17,6 +28,9 @@ Ported from
 | `indian_stocks/selection.py` | the watchlist filters + benchmark regime | `_refresh_stocks`, `_update_market_regime` |
 | `indian_stocks/entry.py` | the entry gate stack | `_select_setup`, `_maintain_entry_limit` |
 | `indian_stocks/frames.py` | candle frame with EMA series ("done" vs "live" EMA) | `calculate_ema` on completed / in-progress candles |
+| `indian_stocks/universe.py` | NSE stock list (Nifty 50/100/200/500, all EQ), ETF/fund/REIT filtering | `_is_equity` |
+| `indian_stocks/data.py` | Yahoo, NSE bhavcopy and CSV candle providers, session-bar helpers | candle fetching |
+| `indian_stocks/cli.py` | `universe`, `fetch`, `scan` | — |
 
 ```python
 from indian_stocks.config import StrategyConfig
@@ -80,15 +94,42 @@ sized 50 → 40 → 30 → 20 → 10 % (floor) of the initial position, max 10; 
 `frames.py` computes EMAs over the full history; the original recomputes over its last 250 candles. They agree to
 within a rounding error once ~100 candles exist (and exactly when given the same input — see the parity tests).
 
+## Data
+
+| `--provider` | Source | Notes |
+|---|---|---|
+| `yahoo` (default) | `yfinance`, `<SYMBOL>.NS`, `^NSEI` | split/dividend **adjusted**; turnover ≈ close × volume |
+| `nse` | NSE full bhavcopy `sec_bhavdata_full_DDMMYYYY.csv` | official, exact traded value, daily only, **unadjusted** (splits/bonuses look like gaps) |
+| `csv` | your own `<SYMBOL>.csv` (`date,open,high,low,close,volume`) | offline / bring-your-own data |
+
+The stock list comes from NSE's index CSVs or `EQUITY_L.csv` (`--universe all`). Only ordinary EQ-series shares are
+kept (ETFs, index funds, InvITs, REITs, T2T/SME series are dropped — a heuristic; use `--blacklist` for strays).
+If NSE is unreachable a short bundled starter list (`data/universe_fallback.csv`, 31 large caps — **not** real
+index membership) is used and a warning is printed.
+
+`scan` shows what the bot would do at the **next open if price opened where it last closed**: which stocks are on
+the watchlist (and, for the rest, which gate dropped them), and for each watchlist stock whether an entry limit
+would be rested, with its limit, −10 % stop and TP1.
+
+> **Verification status.** The Yahoo and NSE download paths were written against their documented formats and
+> tested with mocked responses only — the sandbox this was built in blocks `nseindia.com` and Yahoo. Run
+> `python -m indian_stocks fetch --max-symbols 5` once with internet access to confirm them. Everything else is
+> tested offline. The **ADR ≥ 4 % floor is high for Indian stocks** (large caps typically run well under it), so
+> expect the watchlist to skew to volatile mid/small caps; lower it with `--adr-min`.
+
 ## Tests
 
-`python -m pytest` — 37 tests.
+`python -m pytest` — 64 tests.
 
 * **Parity with the original** (`tests/test_parity.py`): the original bot's `calculate_ema`, `_weak_run_decision`,
   `_raw_setup`, `_closed_candle_confirms`, `_daily_ribbon_confirms` and the whole `_check_exit` ladder are
   extracted from its source with `ast` and run next to the ports on thousands of random inputs. Set `EMA_BOT_PATH`
   to the original file (the module is skipped if it is absent).
 * Rule examples, every selection gate, and every entry gate in isolation.
+* Data parsing (bhavcopy, Yahoo normalisation/caching with mocked downloads, session-bar resampling, incomplete
+  last bar), universe filtering, and the CLI end-to-end on CSV files.
 
-Earlier versions of this repo also had a portfolio backtester, a daily scanner, Yahoo/NSE data providers and a
-CLI; they were removed on request and are in git history at commit `1c93ccc`.
+## What is not here
+
+* **A backtester** — deliberately left out. (An earlier commit, `1c93ccc`, had one; it was removed on request.)
+* Broker integration / live order placement, alerts, trade logging, restart-sync.

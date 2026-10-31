@@ -1,4 +1,4 @@
-"""Entry gates.
+"""Entry gates, used by the `scan` command.
 
 Port of `_select_setup` + `_maintain_entry_limit` (+ the reason text of `_flat_reason`).
 
