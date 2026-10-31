@@ -11,7 +11,7 @@ python -m indian_stocks universe --universe nifty500     # candidate list (NSE i
 python -m indian_stocks fetch    --universe nifty500     # download + cache daily candles
 python -m indian_stocks scan     --universe nifty500     # today's watchlist + entry limits, stops, TP1
 
-python -m pytest                                         # 73 tests, no network needed
+python -m pytest                                         # 109 tests, no network needed
 ```
 
 Ported from
@@ -25,7 +25,8 @@ Ported from
 |---|---|---|
 | `indian_stocks/config.py` | every parameter (`StrategyConfig`) | module constants + `VENUE_CFG["stocks"]` |
 | `indian_stocks/rules.py` | pure rule functions | `calculate_ema`, `_weak_run_decision`, `_check_exit`, `_raw_setup`, `_closed_candle_confirms`, `_daily_ribbon_confirms`, `_would_fill_immediately`, near-high / extension / lower-high helpers, `_add_size_pct` |
-| `indian_stocks/selection.py` | the watchlist filters + benchmark regime | `_refresh_stocks`, `_update_market_regime` |
+| `indian_stocks/selection.py` | `build_watchlist` (the whole pipeline: filters, RS ranking, `rs_top_n` caps, leader/laggard rules, ordering) + `select_symbol` + benchmark regime | `_refresh_stocks`, `_update_market_regime` |
+| `indian_stocks/trader.py` | **`Trader`** - the per-stock decision engine: one `check_strategy()` == one poll of the original (stop/fill detection, restart-sync, exit check, TP2, scale-in, entry limit). Broker-agnostic (`Broker` + `Venue` interfaces) | `EMAPullbackTrader` |
 | `indian_stocks/position.py` | stop levels, TP1/TP2, breakeven, stop re-basing after an add, add gates and sizes | `_on_entry_limit_filled`, `_place_tp_for_position`, `_tp2_target`, `check_tp_filled`, `_on_additional_filled`, `_maintain_additional_limit` gates |
 | `indian_stocks/entry.py` | the entry gate stack | `_select_setup`, `_maintain_entry_limit` |
 | `indian_stocks/frames.py` | candle frame with EMA series ("done" vs "live" EMA) | `calculate_ema` on completed / in-progress candles |
@@ -120,7 +121,7 @@ would be rested, with its limit, −10 % stop and TP1.
 
 ## Tests
 
-`python -m pytest` — 73 tests.
+`python -m pytest` — 109 tests (~2 min; the oracle tests need the original file: set `EMA_BOT_PATH`, they skip if it is absent).
 
 * **Parity with the original** (`tests/test_parity.py`): the original bot's `calculate_ema`, `_weak_run_decision`,
   `_raw_setup`, `_closed_candle_confirms`, `_daily_ribbon_confirms` and the whole `_check_exit` ladder are
@@ -132,22 +133,48 @@ would be rested, with its limit, −10 % stop and TP1.
 
 ## How closely this follows the original
 
-**Ported and checked against the original's own code** (`tests/test_parity.py` executes the original functions):
-EMA, the lower-close exit, the full exit ladder, the entry setup, the closed-candle confirmation, the daily-ribbon
-test, and the near-high / limit-extension / lower-high helpers.
+The original is used as an **oracle**: `tests/oracle.py` imports it with the Hyperliquid SDK stubbed and drives the
+real `EMAPullbackTrader.check_strategy()` and `EMAPullbackBot._refresh_stocks()` against a small fake exchange
+(order book, positions, stop-market triggers, fills on price moves, partial fills, controllable clock).
 
-**Ported from reading the code, covered by unit tests but *not* executed against the original** (those parts are
-buried in methods that talk to the exchange): the selection pipeline (`selection.py`), the order of the entry gates
-(`entry.py`), and the stop / TP1 / TP2 / scale-in arithmetic (`position.py`).
+**Trader** (`tests/test_oracle_diff.py`, 34 scenario tests): the original and `indian_stocks.trader.Trader`
+run on identical fake exchanges with identical candles and price paths (4 polls/day, or 30-minute polls on 1h/4h/1d
+candles). After **every poll** the resting orders (side, size, price, reduce-only, trigger), the position and ~20
+trader fields (adds, TP flags, stop price, pending orders, tier stops, same-day gates) must be identical. Families:
+default stocks config, gaps through stops, tiered stops, shorts, both directions, `stop_to_new_avg_after_add`,
+breakeven off, entry/pyramid on EMA21/EMA50, all exit modes x lower-close references, filters off, adds-heavy
+config, TP off, long limit-refresh, regime toggling, watchlist block / drawdown pause, partial fills, restart-sync
+(no stop / valid / wrong-side / duplicate stops, an already-profitable position), and 1h-signal / 1h- and 4h-pyramid
+timeframes. Each family also asserts that it really exercised what it targets (e.g. tier stops fired, adds and TP2
+filled).
 
-**Deliberately not ported** (operational, not strategy): order-id tracking and the exchange-side stop reconciliation
-(`_defensive_stop_check`, `_enforce_single_orders`, tier-stop re-placement), restart-sync / adopting existing positions,
-partial-fill top-up and protection of a half-filled entry, rate-limit back-off, Telegram and trade logging, and the
-daily-drawdown pause (its default in the original is **off**, `MAX_DAILY_DRAWDOWN_PCT = 0`).
+**Selection** (`tests/test_oracle_selection.py`): the original `_refresh_stocks` and `build_watchlist` get the same
+candles and config (60 random universes/configs, benchmark sometimes missing, young stocks, corrupt feeds, plus a
+leader/laggard-overlap case) and must return the same **ordered** watchlist with the same RS sides.
 
-**Changed on purpose:** the 24-hour rolling volume becomes the last completed day's traded value; the bot's
-~30-minute polling (hourly limit refresh, intraday re-pricing of the EMA9 limit) is replaced by one evaluation —
-`scan` shows what would be rested at the next open.
+**Primitives** (`tests/test_parity.py`): EMA, lower-close rule, exit ladder, setup, confirmations, helpers - original
+functions executed side by side on thousands of random inputs.
+
+**Mutation check:** the port was deliberately broken in 16 ways (wrong TP2 fraction, stop %, no same-day block after
+a stop, add profit gate removed, partial-entry protection removed, breakeven off, restart-sync of winners, RS cap
+ignored/wrong end, ascending ranking, no-ADR-data kept, overlap unresolved, benchmark fallback, ...). 15 were caught
+(two only after I improved the test data); the 16th ("`flat_reason` no longer warms the daily caches") is an
+*equivalent* mutant - it cannot change behaviour, since both code paths run in the same poll on the same data.
+
+**What this does and does not prove.** It proves the port makes the *same decisions as the original code* on the same
+inputs, on a fake exchange. It does not prove anything about real Hyperliquid or real NSE behaviour: fills in the fake
+are instantaneous at the limit/trigger price, with no fees or slippage, and only full or fixed-fraction partial fills.
+
+**Not ported** (operational / not strategy): the `EMAPullbackBot` orchestrator (creating and garbage-collecting
+traders, adopting positions in symbols the bot has no trader for, universe refresh cadence and regime scheduling -
+the regime *function* is ported and tested), rate-limit back-off and sleeps, Telegram and trade logging, the
+daily-drawdown balance bookkeeping (the pause flag itself is supported; the original's default is **off**), and the
+status printing. There is **no NSE `Broker` implementation** - `Trader` needs an adapter for Zerodha / Upstox / Dhan
+that implements the 7-method `Broker` protocol.
+
+**Changed on purpose:** price/size rounding is a `Venue` (NSE: Rs 0.05 tick, whole shares; the oracle tests inject the
+original's Hyperliquid rounding so both sides are compared on equal terms); the 24-hour rolling volume becomes the last
+completed day's traded value; `scan` evaluates once at the last close instead of polling.
 
 ## What is not here
 
